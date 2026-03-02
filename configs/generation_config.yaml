@@ -1,0 +1,27 @@
+teacher_model:
+  # DashScope API (OpenAI-compatible)
+  name: "openai/qwen-plus"
+  api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  # api_key set via env var DASHSCOPE_API_KEY
+  # Alternative: local vllm
+  # name: "openai/Qwen/Qwen3-8B"
+  # api_base: "http://localhost:8000/v1"
+
+user_simulator:
+  name: "openai/qwen-plus"
+  api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+predictive_decoding:
+  K: 5                      # candidates per step
+  H: 2                      # foresight turns
+  candidate_temperature: 0.8
+  foresight_temperature: 0.0
+
+domains:
+  - "retail"
+  - "airline"
+
+output_dir: "data/raw_trajectories"
+num_trials_per_task: 3
+max_concurrency: 5
+max_steps: 30

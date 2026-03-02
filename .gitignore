@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Environments
+.env
+.venv
+env/
+
+# Data (raw trajectories can be large; keep dataset stats but not full data)
+data/raw_trajectories/
+data/sft_dataset/
+data/dpo_dataset/
+
+# Model outputs
+outputs/models/
+outputs/results/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
