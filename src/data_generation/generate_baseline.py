@@ -6,12 +6,17 @@ Run:
         --domain retail \
         --task-ids 0 1 2 \
         --model openai/qwen-plus
+
+    # Use train split only (default, recommended)
+    python -m src.data_generation.generate_baseline \
+        --domain retail --split train --model openai/qwen-plus
 """
 
 import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -26,6 +31,7 @@ from src.predictive_decoding.tau_bench_adapter import (
     configure_litellm_for_dashscope,
     create_orchestrator,
     get_tasks,
+    load_task_split,
 )
 from src.predictive_decoding.core import _extract_conversation, _compute_final_reward
 
@@ -39,6 +45,8 @@ def run_baseline_episode(
     max_steps: int = 30,
 ) -> dict:
     """Run a single episode with standard greedy decoding."""
+    episode_start = time.time()
+
     orch = create_orchestrator(
         domain=domain,
         task=task,
@@ -59,6 +67,10 @@ def run_baseline_episode(
 
     final_reward = _compute_final_reward(orch, task)
     conversation = _extract_conversation(orch)
+    wall_time_s = time.time() - episode_start
+
+    # Each non-ENV step involves ~2 API calls (agent + user)
+    api_calls_approx = step_count * 2
 
     return {
         "task_id": task.id,
@@ -68,6 +80,8 @@ def run_baseline_episode(
             orch.termination_reason.value if orch.termination_reason else "unknown"
         ),
         "num_steps": step_count,
+        "wall_time_s": round(wall_time_s, 2),
+        "api_calls_approx": api_calls_approx,
         "source": "baseline",
     }
 
@@ -77,26 +91,41 @@ def main():
     parser.add_argument("--domain", default="retail")
     parser.add_argument(
         "--task-ids", nargs="*", default=None,
-        help="Specific task IDs to generate. Omit to run all tasks."
+        help="Specific task IDs to generate. Omit to use --split."
+    )
+    parser.add_argument(
+        "--split", default="train", choices=["train", "test", "all"],
+        help="Which task split to use (train/test/all). Ignored if --task-ids given."
     )
     parser.add_argument("--model", default="openai/qwen-plus")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--output-dir", default="data/raw_trajectories")
-    parser.add_argument("--task-split", default="base")
+    parser.add_argument("--task-split", default="base",
+                        help="tau2-bench internal split name (usually 'base')")
     parser.add_argument("--max-steps", type=int, default=30)
     args = parser.parse_args()
 
     configure_litellm_for_dashscope()
 
     tasks = get_tasks(args.domain, task_split=args.task_split)
+
     if args.task_ids:
         tasks = [t for t in tasks if t.id in args.task_ids]
-    logger.info(f"Running baseline on {len(tasks)} tasks in '{args.domain}'")
+    else:
+        split_ids = load_task_split(args.domain, args.split)
+        if split_ids is not None:
+            tasks = [t for t in tasks if t.id in split_ids]
+
+    logger.info(
+        f"Running baseline on {len(tasks)} tasks in '{args.domain}' "
+        f"(split={args.task_ids or args.split})"
+    )
 
     output_dir = Path(args.output_dir) / args.domain
     output_dir.mkdir(parents=True, exist_ok=True)
 
     successes = 0
+    total_time = 0.0
     for i, task in enumerate(tasks):
         logger.info(f"[{i+1}/{len(tasks)}] Task {task.id}")
         try:
@@ -114,8 +143,11 @@ def main():
 
             reward = result["final_reward"]
             successes += int(reward == 1.0)
+            total_time += result["wall_time_s"]
             logger.info(
                 f"  reward={reward}, steps={result['num_steps']}, "
+                f"time={result['wall_time_s']:.1f}s, "
+                f"api_calls≈{result['api_calls_approx']}, "
                 f"termination={result['termination_reason']}"
             )
         except Exception as e:
@@ -123,7 +155,8 @@ def main():
 
     logger.info(
         f"\nBaseline done: {successes}/{len(tasks)} succeeded "
-        f"({100*successes/len(tasks):.1f}%)"
+        f"({100*successes/max(len(tasks),1):.1f}%), "
+        f"total time={total_time:.1f}s"
     )
 
 

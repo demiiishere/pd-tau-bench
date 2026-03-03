@@ -4,12 +4,17 @@ Generate PD trajectories and optionally baseline trajectories.
 Run:
     # Debug: single task, small K and H
     python -m src.data_generation.generate_trajectories \
-        --domain retail --task-ids 0 --K 3 --H 1 --model openai/qwen-plus
+        --domain retail --task-ids 0 --K 3 --H 2 --model openai/qwen-plus
 
-    # Full run
+    # Train split (default, recommended for data generation)
     python -m src.data_generation.generate_trajectories \
         --domain retail airline --K 5 --H 2 --num-trials 3 \
         --model openai/qwen-plus --max-concurrency 5
+
+    # Test split (for evaluation only — do NOT use for training data)
+    python -m src.data_generation.generate_trajectories \
+        --domain retail --split test --K 5 --H 2 --num-trials 1 \
+        --model openai/qwen-plus
 """
 
 import argparse
@@ -30,6 +35,7 @@ from src.predictive_decoding.tau_bench_adapter import (
     configure_litellm_for_dashscope,
     create_orchestrator,
     get_tasks,
+    load_task_split,
 )
 
 
@@ -71,7 +77,14 @@ def run_one_trial(
     with open(pd_path, "w", encoding="utf-8") as f:
         json.dump(pd_result, f, indent=2, ensure_ascii=False)
 
-    result = {"task_id": task.id, "trial": trial, "pd_reward": pd_result["final_reward"]}
+    result = {
+        "task_id": task.id,
+        "trial": trial,
+        "pd_reward": pd_result["final_reward"],
+        "pd_time_s": pd_result.get("wall_time_s", 0),
+        "pd_api_calls": pd_result.get("api_calls_approx", 0),
+        "pd_steps_skipped": pd_result.get("pd_steps_skipped_count", 0),
+    }
 
     # Baseline trajectory (trial 0 only to save API cost)
     if also_baseline and trial == 0:
@@ -95,14 +108,20 @@ def run_one_trial(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--domain", nargs="+", default=["retail"])
-    parser.add_argument("--task-ids", nargs="*", default=None)
+    parser.add_argument("--task-ids", nargs="*", default=None,
+                        help="Specific task IDs. If given, overrides --split.")
+    parser.add_argument(
+        "--split", default="train", choices=["train", "test", "all"],
+        help="Which task split to use (default: train). Use 'test' for evaluation only."
+    )
     parser.add_argument("--K", type=int, default=5)
     parser.add_argument("--H", type=int, default=2)
     parser.add_argument("--candidate-temperature", type=float, default=0.8)
     parser.add_argument("--foresight-temperature", type=float, default=0.0)
     parser.add_argument("--model", default="openai/qwen-plus")
     parser.add_argument("--output-dir", default="data/raw_trajectories")
-    parser.add_argument("--task-split", default="base")
+    parser.add_argument("--task-split", default="base",
+                        help="tau2-bench internal split name (usually 'base')")
     parser.add_argument("--num-trials", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--max-concurrency", type=int, default=5)
@@ -114,9 +133,19 @@ def main():
     # Collect all (domain, task, trial) jobs
     jobs = []
     for domain in args.domain:
-        tasks = get_tasks(domain, task_split=args.task_split)
+        all_tasks = get_tasks(domain, task_split=args.task_split)
+
         if args.task_ids:
-            tasks = [t for t in tasks if t.id in args.task_ids]
+            tasks = [t for t in all_tasks if t.id in args.task_ids]
+        else:
+            split_ids = load_task_split(domain, args.split)
+            if split_ids is not None:
+                tasks = [t for t in all_tasks if t.id in split_ids]
+            else:
+                tasks = all_tasks
+
+        logger.info(f"Domain={domain}: {len(tasks)} tasks (split={args.task_ids or args.split})")
+
         output_dir = Path(args.output_dir) / domain
         output_dir.mkdir(parents=True, exist_ok=True)
         for task in tasks:
@@ -134,6 +163,7 @@ def main():
 
     successes = 0
     failures = 0
+    total_api_calls = 0
     start = time.time()
 
     def run_job(job):
@@ -161,9 +191,13 @@ def main():
                 result = future.result()
                 pd_r = result.get("pd_reward", "?")
                 bl_r = result.get("baseline_reward", "-")
+                skipped = result.get("pd_steps_skipped", 0)
+                api_c = result.get("pd_api_calls", 0)
+                total_api_calls += api_c
                 logger.info(
                     f"[{domain}] Task {task.id} trial {trial}: "
-                    f"PD={pd_r}, baseline={bl_r}"
+                    f"PD={pd_r}, baseline={bl_r}, "
+                    f"api_calls≈{api_c}, skipped_steps={skipped}"
                 )
                 successes += 1
             except Exception as e:
@@ -172,7 +206,8 @@ def main():
 
     elapsed = time.time() - start
     logger.info(
-        f"\nDone in {elapsed:.1f}s: {successes} succeeded, {failures} failed"
+        f"\nDone in {elapsed:.1f}s: {successes} succeeded, {failures} failed, "
+        f"total api_calls≈{total_api_calls}"
     )
 
 

@@ -11,6 +11,7 @@ At each agent turn, instead of greedily picking one response, we:
 
 import time
 from copy import deepcopy
+from difflib import SequenceMatcher
 from typing import Optional
 
 from loguru import logger
@@ -52,12 +53,17 @@ def run_pd_episode(
         max_steps: Max real simulation steps.
 
     Returns:
-        A dict with: task_id, steps, final_reward, conversation, termination_reason
+        A dict with: task_id, steps, final_reward, conversation, termination_reason,
+        wall_time_s, api_calls_approx, pd_steps_count, pd_steps_skipped_count
     """
+    episode_start = time.time()
+
     # Initialize the orchestrator (sends the first "Hi! How can I help you?" message)
     orchestrator.initialize()
 
     steps = []  # PD decision records for each agent turn
+    pd_steps_count = 0
+    pd_steps_skipped_count = 0  # Steps where all candidates were identical → skipped PD
 
     step_count = 0
     while not orchestrator.done and step_count < max_steps:
@@ -78,8 +84,10 @@ def run_pd_episode(
                 foresight_temperature=foresight_temperature,
             )
             steps.append(step_record)
+            pd_steps_count += 1
+            if step_record.get("skipped_identical"):
+                pd_steps_skipped_count += 1
             # After _pd_step, the orchestrator has advanced past the agent turn
-            # (the chosen candidate was injected and the orchestrator state updated)
         else:
             # Non-agent turn: just step normally (user response, tool call execution)
             orchestrator.step()
@@ -97,6 +105,16 @@ def run_pd_episode(
     # Build conversation in simple format for training
     conversation = _extract_conversation(orchestrator)
 
+    wall_time_s = time.time() - episode_start
+
+    # Estimate API calls: each PD step makes K candidate calls + K*H foresight calls
+    # Skipped steps only made K calls (no foresight). Non-PD steps make ~2 calls (agent+user).
+    non_pd_steps = step_count - pd_steps_count
+    api_calls_approx = (
+        sum(s.get("api_calls_approx", 0) for s in steps)
+        + non_pd_steps * 2
+    )
+
     return {
         "task_id": task.id,
         "steps": steps,
@@ -107,6 +125,11 @@ def run_pd_episode(
             if orchestrator.termination_reason
             else "unknown"
         ),
+        "wall_time_s": round(wall_time_s, 2),
+        "api_calls_approx": api_calls_approx,
+        "pd_steps_count": pd_steps_count,
+        "pd_steps_skipped_count": pd_steps_skipped_count,
+        "source": "pd",
     }
 
 
@@ -123,10 +146,11 @@ def _pd_step(
     Perform one PD decision step at an agent turn.
 
     1. Save current state.
-    2. Generate K candidate agent responses.
-    3. For each candidate, fork → inject → simulate H turns → score.
-    4. Pick best candidate.
-    5. Restore original state, inject best candidate into the real orchestrator.
+    2. Generate K candidate agent responses (with adaptive temperature).
+    3. If all candidates are near-identical, skip PD and use the first one.
+    4. For each candidate, fork → inject → simulate H turns → score.
+    5. Pick best candidate.
+    6. Restore original state, inject best candidate into the real orchestrator.
 
     Returns a record of this step for DPO data construction.
     """
@@ -134,7 +158,7 @@ def _pd_step(
     saved_state = save_orchestrator_state(orchestrator)
     conversation_snapshot = deepcopy(orchestrator.trajectory)
 
-    # ── Step 1: Generate K candidate responses ────────────────────────────────
+    # ── Step 1: Generate K candidate responses (with adaptive temperature) ────
     candidates = _generate_candidates(
         orchestrator=orchestrator,
         incoming_message=incoming_message,
@@ -142,11 +166,28 @@ def _pd_step(
         temperature=candidate_temperature,
     )
 
+    # ── Optimization: Skip PD if all candidates are near-identical ────────────
+    # (happens when the step is highly deterministic, e.g. a required tool call)
+    if _candidates_are_identical(candidates, threshold=0.95):
+        restore_orchestrator_state(orchestrator, saved_state)
+        _inject_agent_response(orchestrator, incoming_message, candidates[0])
+        logger.debug("PD step SKIPPED: all candidates near-identical, using greedy.")
+        return {
+            "conversation_history": [_msg_to_dict(m) for m in conversation_snapshot],
+            "candidates": [_msg_to_dict(candidates[0])],
+            "scores": [None],
+            "chosen_idx": 0,
+            "chosen_action": _msg_to_dict(candidates[0]),
+            "skipped_identical": True,
+            "api_calls_approx": len(candidates),  # Only candidate generation, no foresight
+        }
+
     # ── Step 2 & 3: Foresight rollout + scoring for each candidate ────────────
     candidate_scores = []
+    total_foresight_steps = 0
     for i, candidate in enumerate(candidates):
         restore_orchestrator_state(orchestrator, saved_state)
-        score = _evaluate_candidate(
+        score, fs = _evaluate_candidate(
             orchestrator=orchestrator,
             task=task,
             incoming_message=incoming_message,
@@ -155,6 +196,7 @@ def _pd_step(
             foresight_temperature=foresight_temperature,
         )
         candidate_scores.append(score)
+        total_foresight_steps += fs
         logger.debug(f"  Candidate {i}: score={score:.3f} | {_preview(candidate)}")
 
     # ── Step 4: Pick best candidate ───────────────────────────────────────────
@@ -174,6 +216,8 @@ def _pd_step(
         "scores": candidate_scores,
         "chosen_idx": best_idx,
         "chosen_action": _msg_to_dict(chosen),
+        "skipped_identical": False,
+        "api_calls_approx": len(candidates) + total_foresight_steps,
     }
 
 
@@ -185,7 +229,8 @@ def _generate_candidates(
 ) -> list[AssistantMessage]:
     """
     Generate K diverse candidate responses from the agent LLM.
-    Calls generate() directly to control temperature independently.
+    Uses adaptive temperature: if early candidates are too similar, raises temp
+    to encourage diversity.
     """
     agent: LLMAgent = orchestrator.agent
     agent_state = orchestrator.agent_state
@@ -199,33 +244,104 @@ def _generate_candidates(
     messages = agent_state.system_messages + history
 
     candidates = []
-    for _ in range(K):
+    current_temp = temperature
+    for i in range(K):
+        # Adaptive temperature: if previous candidates are too similar, raise temp
+        if i >= 2:
+            current_temp = _adaptive_temperature(candidates, base_temp=temperature)
+
         try:
             candidate = generate(
                 model=agent.llm,
                 messages=messages,
                 tools=agent.tools,
-                temperature=temperature,
+                temperature=current_temp,
             )
             candidates.append(candidate)
         except Exception as e:
-            logger.warning(f"Failed to generate candidate: {e}")
-            # Fall back to greedy if sampling fails
+            logger.warning(f"Failed to generate candidate {i} (temp={current_temp:.2f}): {e}")
+            # Fall back to base temperature
             try:
                 candidate = generate(
                     model=agent.llm,
                     messages=messages,
                     tools=agent.tools,
-                    temperature=0.0,
+                    temperature=temperature,
                 )
                 candidates.append(candidate)
             except Exception as e2:
-                logger.error(f"Fallback greedy generation also failed: {e2}")
+                logger.error(f"Fallback generation also failed: {e2}")
 
     if not candidates:
         raise RuntimeError("No candidates generated. Check API connectivity.")
 
     return candidates
+
+
+def _adaptive_temperature(
+    candidates_so_far: list,
+    base_temp: float = 0.8,
+    max_temp: float = 1.2,
+) -> float:
+    """
+    Raise temperature if existing candidates are too similar to each other.
+    This encourages diversity when early samples are near-identical.
+    """
+    if len(candidates_so_far) < 2:
+        return base_temp
+
+    texts = []
+    for c in candidates_so_far:
+        if c.content:
+            texts.append(c.content)
+        elif c.tool_calls:
+            texts.append(f"{c.tool_calls[0].name}({c.tool_calls[0].arguments})")
+        else:
+            texts.append("")
+
+    similarities = []
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            sim = SequenceMatcher(None, texts[i], texts[j]).ratio()
+            similarities.append(sim)
+
+    avg_sim = sum(similarities) / len(similarities)
+
+    if avg_sim > 0.9:
+        return min(base_temp + 0.3, max_temp)
+    elif avg_sim > 0.8:
+        return min(base_temp + 0.15, max_temp)
+    return base_temp
+
+
+def _candidates_are_identical(candidates: list, threshold: float = 0.95) -> bool:
+    """
+    Return True if more than half of candidate pairs are near-identical.
+    Used to skip PD foresight when the step is highly deterministic.
+    """
+    if len(candidates) < 2:
+        return False
+
+    texts = []
+    for c in candidates:
+        if c.content:
+            texts.append(c.content)
+        elif c.tool_calls:
+            texts.append(f"{c.tool_calls[0].name}({c.tool_calls[0].arguments})")
+        else:
+            texts.append("")
+
+    total_pairs = 0
+    similar_pairs = 0
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            sim = SequenceMatcher(None, texts[i], texts[j]).ratio()
+            total_pairs += 1
+            if sim > threshold:
+                similar_pairs += 1
+
+    # Skip if more than half of pairs are near-identical
+    return similar_pairs > total_pairs / 2
 
 
 def _evaluate_candidate(
@@ -235,25 +351,28 @@ def _evaluate_candidate(
     candidate: AssistantMessage,
     H: int,
     foresight_temperature: float,
-) -> float:
+) -> tuple[float, int]:
     """
     Evaluate a candidate by injecting it and running H foresight turns.
-    Returns a value score.
+    Returns (value_score, foresight_steps_taken).
     """
     # Set greedy temperature for foresight
     original_temp = orchestrator.agent.llm_args.get("temperature", 0.0)
     set_agent_temperature(orchestrator, foresight_temperature)
 
+    foresight_steps = 0
     try:
         # Inject the candidate as the agent's response
         _inject_agent_response(orchestrator, incoming_message, candidate)
 
-        # Run H more turns (or until done)
+        # Run H more turns (or until done), counting non-ENV steps
         for _ in range(H):
             if orchestrator.done:
                 break
             try:
                 orchestrator.step()
+                if orchestrator.to_role != Role.ENV:
+                    foresight_steps += 1
             except Exception as e:
                 logger.warning(f"Foresight step failed: {e}")
                 break
@@ -264,7 +383,7 @@ def _evaluate_candidate(
         # Always restore temperature
         set_agent_temperature(orchestrator, original_temp)
 
-    return score
+    return score, foresight_steps
 
 
 def _inject_agent_response(

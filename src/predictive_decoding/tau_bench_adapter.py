@@ -2,8 +2,10 @@
 Adapter layer: connects our PD implementation to tau2-bench's internal APIs.
 """
 
+import json
 import os
 from copy import deepcopy
+from pathlib import Path
 from typing import Optional
 
 from tau2.agent.llm_agent import LLMAgent
@@ -34,6 +36,43 @@ def get_tasks(domain: str, task_split: str = "base") -> list[Task]:
     else:
         raise ValueError(f"Unsupported domain: {domain}")
     return _get_tasks(task_split_name=task_split)
+
+
+def load_task_split(
+    domain: str,
+    split: str,
+    splits_path: str = "configs/task_splits.json",
+) -> list[str]:
+    """
+    Load task IDs for a given domain and split ('train' or 'test').
+
+    Args:
+        domain: 'retail' or 'airline'
+        split: 'train', 'test', or 'all'
+        splits_path: path to the task_splits.json file
+
+    Returns:
+        List of task ID strings.
+    """
+    if split == "all":
+        return None  # Caller interprets None as "use all tasks"
+    path = Path(splits_path)
+    if not path.exists():
+        # Try relative to project root
+        project_root = Path(__file__).parent.parent.parent
+        path = project_root / splits_path
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Task splits file not found: {splits_path}. "
+            "Run: python scripts/create_task_splits.py"
+        )
+    with open(path, encoding="utf-8") as f:
+        splits = json.load(f)
+    if domain not in splits:
+        raise ValueError(f"Domain '{domain}' not in {splits_path}")
+    if split not in splits[domain]:
+        raise ValueError(f"Split '{split}' not in {splits_path}['{domain}']")
+    return splits[domain][split]
 
 
 def create_agent(
