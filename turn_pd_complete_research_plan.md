@@ -491,8 +491,8 @@ Abstract
 
 优先级顺序：
 [ ] E0: 评估 Qwen3-8B 零样本 baseline（在 test split 上，无需训练）
-[x] E2: SFT on BoN 295 条（train_loss=0.9648, eval_loss=0.8485, token_acc=0.7801）→ 待评估
-[x] E3: SFT on PD 197 条（train_loss=1.010,  eval_loss=0.7797, token_acc=0.8038）→ 待评估
+[x] E2: SFT on BoN 295 条（70 steps, eval_loss=0.8485, token_acc=0.7801）→ 待评估 | outputs_pd/sft_bon/final/
+[x] E3: SFT on PD  197 条（47 steps, eval_loss=0.7797, token_acc=0.8038）→ 待评估 | outputs_pd/sft_pd/final/
 [ ] E1: SFT on standard 61 条 → 评估 test split
 [ ] E2+: E2 → DPO on BoN episode-level pairs → 评估 test split
 [ ] E4: E3 → DPO on PD turn-level 313 对 → 评估 test split（我们的方法）

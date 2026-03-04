@@ -42,14 +42,18 @@ PD pass@1：retail 55.4%，airline 62.7%（均高于同 domain BoN pass@1）
 
 ### Session 6 更新（2026-03-04）— E2/E3 SFT 训练完成，评估脚本修复
 
-#### 1. SFT 训练结果（服务器 A100，1 epoch，LoRA r=8，q/v only）
+#### 1. SFT 训练结果（服务器 A100，1 epoch，LoRA r=8，alpha=16，dropout=0.1，q_proj+v_proj）
 
-| 实验 | train_loss | eval_loss | token_accuracy | 训练时间 |
-|------|-----------|-----------|---------------|---------|
-| E2 (BoN, 295条) | 0.9648 | 0.8485 | 0.7801 | ~168s |
-| E3 (PD, 197条) | 1.010 | 0.7797 | 0.8038 | ~112s |
+| 实验 | optimizer steps | train_loss(最终) | eval_loss | token_accuracy | 训练时间 |
+|------|----------------|-----------------|-----------|---------------|---------|
+| E2 (BoN, 295条) | 70 | 0.870 | 0.8485 | 0.7801 | ~168s |
+| E3 (PD,  197条) | 47 | 0.841 | 0.7797 | 0.8038 | ~112s |
 
-PD 的 eval_loss 更低、token_accuracy 更高，说明 PD 轨迹质量确实更高（模型更容易学习）。
+**关键观察**：PD 模型用更少的 step 达到更低 eval_loss 和更高 token_accuracy，说明 PD 轨迹质量更高——模型学起来更容易，预示 tau-bench 实际评估 PD 应优于 BoN。
+
+**模型路径（本地）**：
+- E2: `outputs_pd/sft_bon/final/`（adapter only，base: `/user/zhujiatong/models/Qwen3-8B`）
+- E3: `outputs_pd/sft_pd/final/`
 
 #### 2. 评估脚本修复（`src/evaluation/eval_on_tau_bench.py` 3 个 bug）
 

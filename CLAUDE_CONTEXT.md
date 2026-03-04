@@ -424,23 +424,30 @@ echo 'export DASHSCOPE_API_KEY=sk-xxx' >> ~/.bashrc
 
 ### 6. 运行训练
 
+**E2 (BoN) 和 E3 (PD) 已完成**，adapter 已下载到本地 `outputs_pd/`。
+
 ```bash
-cd /root/autodl-tmp/pd-tau-bench
-conda activate pd-tau-bench
+# ── 已完成 ──────────────────────────────────────────────────────
+# E2: SFT on BoN（70 steps，eval_loss=0.8485，token_acc=0.7801，~168s）
+# E3: SFT on PD（47 steps，eval_loss=0.7797，token_acc=0.8038，~112s）
+# 本地路径：outputs_pd/sft_bon/final/ 和 outputs_pd/sft_pd/final/
+# LoRA: r=8, alpha=16, dropout=0.1, target=q_proj+v_proj
+# base model: /user/zhujiatong/models/Qwen3-8B (服务器路径)
 
-# E3: SFT on PD trajectories（约 2-3 小时）
+# ── 待跑 ────────────────────────────────────────────────────────
+# E1: SFT on standard
 python -m src.training.sft_train \
     --model /root/autodl-tmp/models/Qwen3-8B \
-    --dataset data/sft_dataset/train.jsonl \
-    --output /root/autodl-tmp/outputs/sft_pd
+    --dataset data/sft_dataset/train_baseline.jsonl \
+    --output /root/autodl-tmp/outputs/sft_baseline
 
-# E2: SFT on BoN trajectories
-python -m src.training.sft_train \
-    --model /root/autodl-tmp/models/Qwen3-8B \
-    --dataset data/sft_dataset/train_bon.jsonl \
-    --output /root/autodl-tmp/outputs/sft_bon
+# E2+: DPO on BoN episode-level pairs
+python -m src.training.dpo_train \
+    --sft-model /root/autodl-tmp/outputs/sft_bon/final \
+    --dataset data/dpo_dataset/train_bon_episode.jsonl \
+    --output /root/autodl-tmp/outputs/dpo_bon_episode
 
-# E4 (低优先级): DPO after SFT
+# E4: DPO on PD turn-level pairs（我们的方法）
 python -m src.training.dpo_train \
     --sft-model /root/autodl-tmp/outputs/sft_pd/final \
     --dataset data/dpo_dataset/train.jsonl \
@@ -453,7 +460,7 @@ python -m src.training.dpo_train \
 **服务器无外网，评估在本地 Mac 上跑**（服务器只负责 vLLM serving）。
 
 ```bash
-# 服务器：后台启动 vLLM（无需外网）
+# 服务器：后台启动 vLLM（无需外网，指向 adapter 路径）
 nohup vllm serve /root/autodl-tmp/outputs/sft_bon/final \
     --served-model-name finetuned \
     --port 8001 --trust-remote-code --dtype bfloat16 \
