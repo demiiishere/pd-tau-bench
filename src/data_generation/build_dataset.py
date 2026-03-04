@@ -61,7 +61,9 @@ def build_sft_dataset(
     if source_filter == "baseline":
         pattern = "**/*_baseline.json"
     elif source_filter == "bon":
-        pattern = "**/*_bon_summary.json"
+        # Use all individual BoN samples (not summary), so all successful
+        # trajectories are included — gives ~196 samples vs 61 from summary.
+        pattern = "**/*_bon_n*.json"
     else:
         pattern = f"**/*_{source_filter}.json"
 
@@ -76,9 +78,7 @@ def build_sft_dataset(
         if traj.get("final_reward") != 1.0:
             continue
 
-        # BoN uses best_conversation, others use conversation
-        conv_key = "best_conversation" if source_filter == "bon" else "conversation"
-        conv = traj.get(conv_key, traj.get("conversation", []))
+        conv = traj.get("conversation", [])
 
         # Convert conversation to ChatML messages
         messages = _conv_to_chatml(conv)
@@ -262,63 +262,176 @@ def build_dpo_dataset(
     return len(dpo_data)
 
 
+def build_bon_dpo_dataset(
+    raw_dir: Path,
+    output_path: Path,
+    allowed_task_ids: set | None = None,
+):
+    """
+    Build episode-level DPO pairs from BoN trajectories (for E2+ baseline).
+
+    For each task that has both successful and failed BoN episodes, pair the
+    FIRST agent action from a randomly-chosen success with that from a failure.
+    The prompt is the shared prefix [system, first_user_msg] — identical for
+    both since they start from the same task.
+
+    This gives episode-level preference pairs: the DPO signal is "given this
+    task, the first agent action in a successful episode is preferred over the
+    first action in a failed episode."
+
+    Pairs where chosen==rejected are dropped (often happens when the first
+    action is deterministic, e.g. always calling get_order_details first).
+    """
+    import random as _random
+    from collections import defaultdict
+
+    successes: dict[str, list] = defaultdict(list)
+    failures: dict[str, list] = defaultdict(list)
+
+    for filepath in sorted(raw_dir.glob("**/*_bon_n*.json")):
+        with open(filepath, encoding="utf-8") as f:
+            traj = json.load(f)
+
+        task_id = str(traj.get("task_id", ""))
+        if allowed_task_ids is not None and task_id not in allowed_task_ids:
+            continue
+
+        msgs = _conv_to_chatml(traj.get("conversation", []))
+        if not msgs:
+            continue
+
+        if traj.get("final_reward") == 1.0:
+            successes[task_id].append(msgs)
+        else:
+            failures[task_id].append(msgs)
+
+    _random.seed(42)
+    dpo_data = []
+
+    for task_id in sorted(set(successes) & set(failures)):
+        s_msgs = _random.choice(successes[task_id])
+        f_msgs = _random.choice(failures[task_id])
+
+        # Find first assistant message and everything before it
+        def _split_at_first_agent(msgs):
+            for i, m in enumerate(msgs):
+                if m["role"] == "assistant":
+                    return msgs[:i], msgs[i]
+            return None, None
+
+        prompt_s, chosen = _split_at_first_agent(s_msgs)
+        _, rejected = _split_at_first_agent(f_msgs)
+
+        if chosen is None or rejected is None:
+            continue
+        if chosen == rejected:
+            continue
+
+        dpo_data.append({
+            "prompt": prompt_s,       # [system, first_user_msg]
+            "chosen": chosen,         # first agent action from successful episode
+            "rejected": rejected,     # first agent action from failed episode
+            "chosen_score": 1.0,
+            "rejected_score": 0.0,
+            "score_gap": 1.0,
+            "task_id": task_id,
+            "source": "bon_episode",
+        })
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for item in dpo_data:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    print(f"BoN-DPO dataset (episode-level): {len(dpo_data)} pairs → {output_path}")
+    return len(dpo_data)
+
+
+def _append_jsonl(src: Path, dst: Path):
+    """Append contents of src JSONL to dst JSONL."""
+    with open(src, encoding="utf-8") as fsrc, \
+         open(dst, "a", encoding="utf-8") as fdst:
+        for line in fsrc:
+            line = line.strip()
+            if line:
+                fdst.write(line + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--raw-dir", default="data/raw_trajectories")
+    parser.add_argument(
+        "--domains", nargs="+", default=["retail", "airline"],
+        help="Domains to build datasets for. Each domain is processed separately "
+             "to avoid task-ID collisions across domains."
+    )
+    parser.add_argument("--raw-dir", default="data/raw_trajectories",
+                        help="Parent directory containing per-domain subdirectories.")
     parser.add_argument("--sft-output", default="data/sft_dataset/train.jsonl")
     parser.add_argument("--sft-baseline-output", default="data/sft_dataset/train_baseline.jsonl")
     parser.add_argument("--sft-bon-output", default="data/sft_dataset/train_bon.jsonl")
     parser.add_argument("--dpo-output", default="data/dpo_dataset/train.jsonl")
+    parser.add_argument("--bon-dpo-output", default="data/dpo_dataset/train_bon_episode.jsonl",
+                        help="Episode-level DPO pairs from BoN (for E2+ baseline).")
     parser.add_argument("--min-score-gap", type=float, default=0.1)
     parser.add_argument(
         "--split", default="train", choices=["train", "test", "all"],
-        help="Only include trajectories from this task split (default: train). "
-             "IMPORTANT: always use 'train' for building training data."
-    )
-    parser.add_argument(
-        "--domains", nargs="+", default=["retail", "airline"],
-        help="Domains to load split IDs from."
+        help="Task split to include (default: train)."
     )
     args = parser.parse_args()
 
-    raw_dir = Path(args.raw_dir)
+    # Output files start fresh (we'll append per-domain below)
+    for out in [args.sft_output, args.sft_baseline_output,
+                args.sft_bon_output, args.dpo_output, args.bon_dpo_output]:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text("")  # truncate
 
-    # Load allowed task IDs for the requested split
-    allowed_ids = _get_split_ids(args.split, args.domains)
-    if allowed_ids is not None:
-        print(f"Using task split '{args.split}': {len(allowed_ids)} task IDs allowed.")
-    else:
-        print("Using all tasks (no split filter).")
+    totals = {"pd": 0, "baseline": 0, "bon": 0, "dpo": 0, "bon_dpo": 0}
 
-    # SFT from PD successful trajectories
-    n_sft = build_sft_dataset(
-        raw_dir, Path(args.sft_output), source_filter="pd",
-        allowed_task_ids=allowed_ids,
-    )
+    for domain in args.domains:
+        domain_dir = Path(args.raw_dir) / domain
+        if not domain_dir.exists():
+            print(f"[{domain}] Directory not found, skipping: {domain_dir}")
+            continue
 
-    # SFT from baseline successful trajectories (for E2 experiment)
-    n_sft_bl = build_sft_dataset(
-        raw_dir, Path(args.sft_baseline_output), source_filter="baseline",
-        allowed_task_ids=allowed_ids,
-    )
+        # Each domain gets its own allowed task IDs → no cross-domain ID collision
+        allowed_ids = _get_split_ids(args.split, [domain])
+        n_ids = len(allowed_ids) if allowed_ids else "all"
+        print(f"\n[{domain}] split='{args.split}', {n_ids} task IDs allowed")
 
-    # SFT from BoN successful trajectories (for E3 experiment)
-    n_sft_bon = build_sft_dataset(
-        raw_dir, Path(args.sft_bon_output), source_filter="bon",
-        allowed_task_ids=allowed_ids,
-    )
+        import tempfile, os
+        tmp_sft     = Path(tempfile.mktemp(suffix=".jsonl"))
+        tmp_bl      = Path(tempfile.mktemp(suffix=".jsonl"))
+        tmp_bon     = Path(tempfile.mktemp(suffix=".jsonl"))
+        tmp_dpo     = Path(tempfile.mktemp(suffix=".jsonl"))
+        tmp_bon_dpo = Path(tempfile.mktemp(suffix=".jsonl"))
 
-    # DPO preference pairs from PD decision steps
-    n_dpo = build_dpo_dataset(
-        raw_dir, Path(args.dpo_output), args.min_score_gap,
-        allowed_task_ids=allowed_ids,
-    )
+        n_sft     = build_sft_dataset(domain_dir, tmp_sft, "pd",       allowed_ids)
+        n_bl      = build_sft_dataset(domain_dir, tmp_bl,  "baseline", allowed_ids)
+        n_bon     = build_sft_dataset(domain_dir, tmp_bon, "bon",      allowed_ids)
+        n_dpo     = build_dpo_dataset(domain_dir, tmp_dpo, args.min_score_gap, allowed_ids)
+        n_bon_dpo = build_bon_dpo_dataset(domain_dir, tmp_bon_dpo, allowed_ids)
 
-    print(f"\nSummary (split='{args.split}'):")
-    print(f"  SFT (PD):       {n_sft} samples")
-    print(f"  SFT (baseline): {n_sft_bl} samples")
-    print(f"  SFT (BoN):      {n_sft_bon} samples")
-    print(f"  DPO pairs:      {n_dpo} pairs")
+        _append_jsonl(tmp_sft,     Path(args.sft_output))
+        _append_jsonl(tmp_bl,      Path(args.sft_baseline_output))
+        _append_jsonl(tmp_bon,     Path(args.sft_bon_output))
+        _append_jsonl(tmp_dpo,     Path(args.dpo_output))
+        _append_jsonl(tmp_bon_dpo, Path(args.bon_dpo_output))
+
+        for p in [tmp_sft, tmp_bl, tmp_bon, tmp_dpo, tmp_bon_dpo]:
+            p.unlink(missing_ok=True)
+
+        totals["pd"]      += n_sft
+        totals["baseline"] += n_bl
+        totals["bon"]     += n_bon
+        totals["dpo"]     += n_dpo
+        totals["bon_dpo"] += n_bon_dpo
+
+    print(f"\n=== Combined summary (domains={args.domains}, split='{args.split}') ===")
+    print(f"  SFT (PD):           {totals['pd']} samples  → {args.sft_output}")
+    print(f"  SFT (baseline):     {totals['baseline']} samples  → {args.sft_baseline_output}")
+    print(f"  SFT (BoN):          {totals['bon']} samples  → {args.sft_bon_output}")
+    print(f"  DPO pairs (PD):     {totals['dpo']} pairs    → {args.dpo_output}")
+    print(f"  DPO pairs (BoN ep): {totals['bon_dpo']} pairs    → {args.bon_dpo_output}")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,15 @@
 # Claude 工作上下文文档
 
 > 给下一个 Claude 实例在继续工作前阅读的技术备忘录。
+>
+> **本地 Mac（Phase A 数据生成）**
 > 项目路径：`/Users/zhujiatong/pd-tau-bench/`
 > Conda 环境：`pd-tau-bench`（用 `python3.11`，没有 `python` 软链接）
 > API Key：存在用户的 shell 环境变量 `DASHSCOPE_API_KEY` 里（每次对话重新设置）
+>
+> **GPU 服务器（Phase B 训练+评估）**
+> AutoDL A100-PCIE-40GB，项目在 `/root/autodl-tmp/pd-tau-bench/`
+> 环境配置见下方"服务器环境配置"小节
 
 ---
 
@@ -14,8 +20,8 @@
 - 用这个机制生成高质量轨迹数据（SFT + DPO 格式）
 - Phase B：用这些数据 SFT/DPO 微调 Qwen3-8B，验证超过 baseline
 
-**Phase A（本地，基础实现完成，新增 BoN + train/test split + 优化，待跑全量数据）**
-**Phase B（租 GPU，尚未开始）**
+**Phase A（✅ 完成：数据已生成，数据集已构建）**
+**Phase B（🔄 进行中：上服务器做预实验）**
 
 ---
 
@@ -107,26 +113,35 @@ while not orch.done:
 
 ### Value Function (`value_function.py`)
 
+**Session 3 全面改进**，所有信号在 foresight delta（`trajectory[foresight_start_idx:]`）上计算：
+
+```python
+score = 0.35 × delta_progress     # foresight 中新调了多少期望工具
+      + 0.25 × foresight_health   # tool 调用错误/冗余惩罚
+      + 0.15 × user_sentiment     # 用户回复正/负面关键词
+      + 0.15 × termination        # AGENT_STOP=1.0, USER_STOP=0.7, 运行中=0.4
+      + 0.10 × env_assertions     # 满足多少 env 断言（或 action_overlap）
+
+delta_progress:
+  - 1.0: 期望工具在 foresight 前已全部完成
+  - 0.5 + 0.5*(matched/remaining): 有新期望工具被调用
+  - 0.5: 无新工具调用（中性，不惩罚文本回复步骤）
+
+foresight_health:
+  - 1.0: 无错误无冗余
+  - 0.6: penalty <= 1   (1 次错误或 2 次冗余)
+  - 0.3: penalty <= 2
+  - 0.0: penalty > 2
+  - 0.7: 无 tool call（文本步骤，中性）
+
+user_sentiment（关键词匹配最后一条 user 消息）:
+  - 0.75: 正面词 (yes, ok, correct, thanks...)
+  - 0.50: 无 user 消息或中性
+  - 0.25: 负面词 (no, wrong, confused, cancel...)
 ```
-score = 0.5 × assertion_score + 0.3 × termination_score + 0.2 × error_score
 
-assertion_score:
-  - 如果 task 有 env_assertions → 检查当前 env state 满足几个
-  - 否则 → action_overlap（已完成的 expected tool calls 比例）
-
-termination_score:
-  - AGENT_STOP → 1.0
-  - USER_STOP  → 0.7
-  - 未完成     → 0.4
-  - 报错       → 0.0
-
-error_score:
-  - 0 错误 → 1.0
-  - ≤2 错误 → 0.5
-  - ...
-```
-
-**已知限制**：大多数步骤 score gap ≈ 0，因为所有候选调同一个 tool call。只有在文本决策点（需要 COMMUNICATE 的步骤）才有明显区分。H=2 比 H=1 好很多（H=1 完全没有区分度）。
+**效果**：True PD rate（gap > 0.05 的步骤比例）从 6% 提升到 17%。
+**核心改动**：`compute_value()` 现在接受 `foresight_start_idx` 参数，`core.py` 中传递 `foresight_start_idx=traj_len_before`。
 
 ---
 
@@ -144,7 +159,88 @@ fork/restore 测试：3/3 通过。SFT/DPO 数据格式：正确。
 
 ---
 
-## 最新修改（Session 2）
+## 最新修改（Session 4 — 2026-03-04）
+
+### 1. Phase A 数据生成全部完成
+
+| 域 | PD | BoN | Baseline |
+|----|----|-----|---------|
+| retail | 240 ✅ | 400 ✅ | 81 ✅ |
+| airline | 102 ✅ | 174 ✅ | 33 ✅ |
+
+### 2. 最终数据集（已构建完毕）
+
+```
+data/sft_dataset/train.jsonl          197 条  (retail 133 + airline 64)   → E3
+data/sft_dataset/train_bon.jsonl      295 条  (retail 196 + airline 99)   → E2
+data/sft_dataset/train_baseline.jsonl  61 条  (retail 41  + airline 20)   → 参考
+data/dpo_dataset/train.jsonl          313 对  (retail 185 + airline 128)  → E4
+```
+
+### 3. build_dataset.py 三个 bug 修复
+
+1. **BoN 字段名**：summary 文件用 `oracle_reward`，旧代码查 `final_reward` → 全部被过滤（0条）
+2. **跨域 ID 泄漏**：retail/airline task ID 有 27 个重叠，合并 allowed_ids 导致 retail 测试集泄漏进训练集。修复：每个 domain 独立筛选
+3. **BoN 只取 oracle best**：旧代码 1条/task → 61条。修复：用所有 `*_bon_n*.json` 成功样本 → 295条
+
+**正确调用方式**（默认参数即可，内部已分域处理）：
+```bash
+conda run -n pd-tau-bench python3.11 -m src.data_generation.build_dataset
+```
+
+### 4. 数据质量汇总
+
+| 指标 | retail PD | retail BoN | airline PD | airline BoN |
+|------|-----------|-----------|------------|-------------|
+| Pass@1 | 55.4% | 48.5% | 62.7% | 57.7% |
+| Oracle | 82.5% | 76.2% | 85.7% | 88.6% |
+| 全失败 tasks | 14 | 19 | 5 | 4 |
+| 真实 PD 决策 (gap>0.05) | 27% | — | 35% | — |
+| Token/episode | 963k | 89k | 935k | 83k |
+
+---
+
+## 历史修改（Session 3 — 2026-03-03）
+
+### 1. Value Function 大改进
+
+见上方 "Value Function" 小节。核心：5 个 delta-based 信号，`foresight_start_idx` 参数。
+
+### 2. BoN 完成 + PD 重新生成
+
+- BoN 80/80 retail tasks 完成：oracle@5=76%，pass@1=49%，每 task 447k tokens
+- 旧 PD 数据全部删除，用新 value function 重新生成（后台运行中）
+- PD pass@1=57% > BoN pass@1=49%（公平比较，均为单轨迹）
+
+### 3. GPU 策略：RTX 5090 (32GB)，无需量化
+
+- Qwen3-8B bf16 ≈ 16GB，LoRA+优化器 ≈ 2GB，activations ≈ 2-4GB → 总计 ~20GB
+- 仍需 `gradient_checkpointing=True`（处理 8192 token 序列）
+
+### 4. 训练脚本修复（`src/training/`）
+
+**sft_train.py 改动**：
+- `trust_remote_code=True`，`model.config.use_cache = False`
+- `tokenizer.apply_chat_template()` 处理带 tool_calls 的 messages 列
+- `gradient_checkpointing=True`，`gradient_checkpointing_kwargs={"use_reentrant": False}`
+- `dataset_text_field="text"`，`lr_scheduler_type="cosine"`
+- `--source` 过滤参数，eval split（5%），保存 tokenizer
+
+**dpo_train.py 改动**：
+- `ref_model=None`（PEFT 模式，省 16GB VRAM）
+- DPO 数据预处理：`prompt_text + chosen_full[len(prompt_text):]`
+- 同样的 gradient_checkpointing 设置
+- `--min-score-gap` 过滤（默认 0.05）
+
+### 5. 论文策略
+
+- E1+E2+E3 = 可发表最小组合
+- E4（DPO）：~390 对，67% gap<0.10，预期提升 0-3pp，低优先级
+- **关键路径**：完成 PD 生成 → build_dataset → 租 GPU → Phase B 训练 → 评估
+
+---
+
+## 历史修改（Session 2）
 
 ### 1. Train/Test Split（`configs/task_splits.json`）
 
@@ -233,38 +329,332 @@ python -m src.data_generation.generate_bon \
 
 ---
 
-## 下一步工作（按优先级）
+## 服务器环境配置（AutoDL A100 40GB，Phase B）
 
-### 1. 全量数据生成（立刻可以跑，Train split 只）
+> 本节给在 GPU 服务器上首次开启的 Claude 实例看。本地 Mac 不需要这些步骤。
+
+### 0. AutoDL 开机镜像选择
+
+开实例时选：**PyTorch 2.x / CUDA 12.8（或 12.4）/ Python 3.10（或 3.11）**。
+优先选 12.8（驱动更新，支持更新的 wheel）；12.4 也完全够用。不要选 TensorFlow 镜像。
+
+### 1. 上传项目文件
 
 ```bash
-conda activate pd-tau-bench
-cd /Users/zhujiatong/pd-tau-bench
-export DASHSCOPE_API_KEY=xxx
+# 本地执行：把整个项目压缩后上传（排除不必要的大文件）
+tar --exclude='./data/raw_trajectories' \
+    --exclude='./.git' \
+    --exclude='./tau2-bench/.git' \
+    -czf pd-tau-bench.tar.gz .
 
-# PD 轨迹（使用 train split，默认）
-python -m src.data_generation.generate_trajectories \
-    --domain retail airline --K 5 --H 2 \
-    --model openai/qwen-plus --num-trials 3 \
-    --max-concurrency 5
-# split 默认为 train，无需额外指定
+# 用 AutoDL 的文件上传功能，或：
+scp -P <port> pd-tau-bench.tar.gz root@<ip>:/root/autodl-tmp/
 
-# BoN 基线（同样使用 train split）
-python -m src.data_generation.generate_bon \
-    --domain retail airline --N 5 \
-    --model openai/qwen-plus --max-concurrency 5
-
-# 构建训练数据集
-python -m src.data_generation.build_dataset
+# 服务器上解压
+cd /root/autodl-tmp
+tar -xzf pd-tau-bench.tar.gz -C pd-tau-bench
+cd pd-tau-bench
 ```
 
-预期产出：~240 SFT(PD) + ~960 DPO + ~240 SFT(BoN)，耗时 6-10h，花费 ¥50-100。
+> **注意**：AutoDL 的 `/root/autodl-tmp` 是高速 SSD，数据和模型都放这里。
+> `/root` 本身空间很小，不要在那里存大文件。
 
-### 2. Phase B（租 GPU 后）
+### 2. 上传数据集
 
-- A100 40G，AutoDL 或 Featurize，~¥3-5/h
-- 4 组实验：E1(zero-shot), E2(SFT BoN), E3(SFT PD), E4(SFT+DPO PD)
-- 评估命令在 `scripts/step4_eval.sh` 里
+把本地 `data/sft_dataset/` 和 `data/dpo_dataset/` 上传到服务器同路径：
+
+```bash
+# 本地执行
+scp -P <port> -r data/sft_dataset data/dpo_dataset root@<ip>:/root/autodl-tmp/pd-tau-bench/data/
+```
+
+### 3. 安装 Python 依赖
+
+```bash
+# 创建 conda 环境（如果镜像已有 python 3.11 也可以直接用）
+conda create -n pd-tau-bench python=3.11 -y
+conda activate pd-tau-bench
+
+# 用清华镜像加速 pip
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 训练依赖
+# CUDA 12.8（AutoDL 推荐选项）
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# 如果 cu128 wheels 还没发布，cu124 在 12.8 驱动上也能跑（12.x 向后兼容）
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install transformers>=4.45 trl>=0.9 peft>=0.12 datasets>=2.20 accelerate>=0.33
+pip install bitsandbytes loguru  # bitsandbytes 备用，当前脚本不用量化
+
+# 评估依赖（serving 微调后的模型）
+pip install vllm
+
+# tau2-bench（评估时需要，tau2 是我们用的 benchmark 框架）
+cd tau2-bench
+pip install -e .
+cd ..
+```
+
+### 4. 下载 Qwen3-8B 模型（国内用镜像）
+
+```bash
+# 设置 HuggingFace 镜像（国内服务器必须）
+export HF_ENDPOINT=https://hf-mirror.com
+
+# 下载到 autodl-tmp（大约 16GB）
+pip install huggingface_hub
+huggingface-cli download Qwen/Qwen3-8B \
+    --local-dir /root/autodl-tmp/models/Qwen3-8B \
+    --local-dir-use-symlinks False
+```
+
+### 5. 设置环境变量
+
+```bash
+# DASHSCOPE_API_KEY 用于评估时的 user simulator（调 qwen-plus）
+export DASHSCOPE_API_KEY=sk-xxx
+
+# HF 镜像（每次开机需要重设，或写入 ~/.bashrc）
+export HF_ENDPOINT=https://hf-mirror.com
+
+# 可以写入 ~/.bashrc 让它持久化：
+echo 'export HF_ENDPOINT=https://hf-mirror.com' >> ~/.bashrc
+echo 'export DASHSCOPE_API_KEY=sk-xxx' >> ~/.bashrc
+```
+
+### 6. 运行训练
+
+```bash
+cd /root/autodl-tmp/pd-tau-bench
+conda activate pd-tau-bench
+
+# E3: SFT on PD trajectories（约 2-3 小时）
+python -m src.training.sft_train \
+    --model /root/autodl-tmp/models/Qwen3-8B \
+    --dataset data/sft_dataset/train.jsonl \
+    --output /root/autodl-tmp/outputs/sft_pd
+
+# E2: SFT on BoN trajectories
+python -m src.training.sft_train \
+    --model /root/autodl-tmp/models/Qwen3-8B \
+    --dataset data/sft_dataset/train_bon.jsonl \
+    --output /root/autodl-tmp/outputs/sft_bon
+
+# E4 (低优先级): DPO after SFT
+python -m src.training.dpo_train \
+    --sft-model /root/autodl-tmp/outputs/sft_pd/final \
+    --dataset data/dpo_dataset/train.jsonl \
+    --output /root/autodl-tmp/outputs/dpo_pd \
+    --min-score-gap 0.10
+```
+
+### 7. 运行评估
+
+评估流程：先用 vLLM serve 微调后的模型，再跑 eval 脚本。
+
+```bash
+# 终端 1：启动 vLLM server（占用 GPU）
+vllm serve /root/autodl-tmp/outputs/sft_pd/final \
+    --port 8001 \
+    --trust-remote-code \
+    --dtype bfloat16
+
+# 终端 2：跑评估（用 test split，5 次 trial 取平均）
+python -m src.evaluation.eval_on_tau_bench \
+    --domain retail \
+    --split test \
+    --model-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 5 \
+    --output results/sft_pd_eval.json
+```
+
+E1（zero-shot baseline）把 `--model-url` 指向未微调的 Qwen3-8B 即可。
+
+### 常见坑（服务器专属）
+
+- **vLLM 启动慢**：首次加载模型需要 2-5 分钟，等 `Uvicorn running on...` 出现再跑评估
+- **autodl-tmp 掉电不持久**：关机前把重要产出（模型、结果）同步到对象存储或下载到本地
+- **CUDA OOM**：如果 SFT 时 OOM，先检查是否有其他进程占用 GPU：`nvidia-smi`
+- **HF 下载失败**：确认 `HF_ENDPOINT` 已设置，或手动指定 `--endpoint https://hf-mirror.com`
+
+---
+
+## Phase B 训练策略（Session 5 决策）
+
+### 核心原则：小数据体制下的训练
+
+197 条域内 SFT 数据处于 8B 模型训练的下限。训练策略不对会导致过拟合或学不到东西。
+关键参考：Lima (2023) 用 1000 条精选数据就调出接近 GPT-4 的对话质量。
+τ-bench 的任务格式高度统一，模型学的是"调整决策偏好"而不是"新技能"，所以数据需求更少。
+
+### LoRA 配置（已更新到训练脚本）
+
+```python
+# 小数据体制：rank 低，只调 Q/V，dropout 高
+LoraConfig(
+    r=8,               # 不用 16/32 —— 可训练参数越少，越不容易过拟合
+    lora_alpha=16,     # alpha/r = 2
+    target_modules=["q_proj", "v_proj"],  # 只调 Q 和 V，跳过 K/O/MLP
+    lora_dropout=0.1,  # 加大 dropout 防过拟合
+)
+```
+
+### SFT 超参（已更新）
+
+```python
+SFTConfig(
+    num_train_epochs=1,           # 多 epoch = 反复背诵；1 个就够
+    learning_rate=5e-5,           # 比默认偏高，少数据需要更大步长
+    gradient_accumulation_steps=4,# 有效 batch=4（之前是 8）
+    warmup_ratio=0.1,
+    lr_scheduler_type="cosine",
+)
+```
+
+### DPO 超参（已更新）
+
+```python
+DPOConfig(
+    num_train_epochs=1,
+    learning_rate=1e-6,   # 比 SFT 小 50 倍，DPO 超参非常敏感
+    beta=0.3,             # 偏大 KL 惩罚（原论文 0.1），防止小数据下模型漂移太远
+    gradient_accumulation_steps=4,
+)
+```
+
+### 通用数据混合（关键正则化手段）
+
+**这是把 ~200 条域内数据用好的核心手段。** 单独用 197 条训，模型很可能过拟合到 τ-bench 的特定用语。
+混入 ~3000 条通用 function calling 数据（如 glaive-function-calling-v2）作为正则化：
+
+```bash
+# 下载 glaive 数据（约 110k 条，取前 3000）
+# huggingface-cli download glaiveai/glaive-function-calling-v2 --local-dir ...
+# 预处理成 {"messages": [...]} 格式，取 3000 条存为 data/general/glaive_3k.jsonl
+
+# 训练时加 --general-data（三组实验用完全相同的通用数据）
+python -m src.training.sft_train \
+    --model ... --dataset data/sft_dataset/train.jsonl \
+    --general-data data/general/glaive_3k.jsonl \
+    --output ...
+```
+
+**重要**：E1/E2/E3 必须用完全相同的通用数据（3000 条），唯一变量是 ~200 条域内数据来源。
+
+### 实验矩阵（更新后）
+
+| 编号 | 训练数据 | 方法 | 域内数据量 | 说明 |
+|------|---------|------|----------|------|
+| E0 | — | zero-shot | 0 | baseline |
+| E1 | standard成功轨迹 | SFT | ~61 条 | 对照 |
+| E2 | BoN 成功轨迹 | SFT | ~295 条 | BoN baseline |
+| E2+ | BoN + episode-level DPO | SFT→DPO | 同 E2 + BoN 偏好对 | BoN+DPO baseline |
+| E3 | PD 成功轨迹 | SFT | ~197 条 | PD-SFT |
+| E4 | PD + turn-level DPO | SFT→DPO | 同 E3 + 313 对 | **我们的方法** |
+
+所有 SFT 实验均混入相同的 3000 条通用数据。
+
+**核心对比链**：
+- E2 → E2+：episode-level DPO 有没有用
+- E2+ → E4：**turn-level DPO vs episode-level DPO**（论文最强 claim）
+- E3 → E4：DPO 偏好数据的额外贡献
+
+### E2+ 数据构建（已实现）
+
+```bash
+# 重新构建所有数据集（同时生成 BoN episode-level DPO 对）
+python -m src.data_generation.build_dataset
+# 额外输出：data/dpo_dataset/train_bon_episode.jsonl
+```
+
+E2+ DPO 训练：
+```bash
+python -m src.training.dpo_train \
+    --sft-model outputs/sft_bon/final \
+    --dataset data/dpo_dataset/train_bon_episode.jsonl \
+    --output outputs/dpo_bon_episode
+```
+
+### 数据量风险缓解
+
+如果域内数据仍嫌不足，优先考虑：
+1. **增加 PD trials**：当前 3 trials/task → 改 5 trials，PD SFT 预计从 197 涨到 ~300
+2. **合并 PD+BoN 成功轨迹**：两者都是高质量成功轨迹，合并约 ~490 条
+3. **调整 split 比例**：70/30 → 85/15（更多训练任务 → 更多成功轨迹）
+
+---
+
+## 下一步工作（Phase B，当前阶段）
+
+### 1. 上传文件到服务器
+
+```bash
+# 本地：打包项目（排除原始轨迹，只需数据集）
+tar --exclude='./data/raw_trajectories' \
+    --exclude='./.git' \
+    --exclude='./tau2-bench/.git' \
+    -czf pd-tau-bench.tar.gz .
+
+# 上传数据集（约 50MB）
+scp -P <port> -r data/sft_dataset data/dpo_dataset root@<ip>:/root/autodl-tmp/pd-tau-bench/data/
+```
+
+### 2. 服务器训练（含通用数据混合，优先级顺序）
+
+```bash
+cd /root/autodl-tmp/pd-tau-bench
+conda activate pd-tau-bench
+
+# 可选：先重新构建数据集（如果需要 BoN episode-level DPO 对 E2+）
+python -m src.data_generation.build_dataset
+# 新增输出：data/dpo_dataset/train_bon_episode.jsonl
+
+# （可选）下载并准备通用数据（各实验共享，glaive ~3k 条）
+# 见 CLAUDE_CONTEXT.md "Phase B 训练策略" 小节
+
+# E2: SFT on BoN（295 条，先跑做 debug，最快）
+python -m src.training.sft_train \
+    --model /root/autodl-tmp/models/Qwen3-8B \
+    --dataset data/sft_dataset/train_bon.jsonl \
+    --output /root/autodl-tmp/outputs/sft_bon
+    # [+ --general-data data/general/glaive_3k.jsonl 如果已准备]
+
+# E3: SFT on PD（197 条，核心实验）
+python -m src.training.sft_train \
+    --model /root/autodl-tmp/models/Qwen3-8B \
+    --dataset data/sft_dataset/train.jsonl \
+    --output /root/autodl-tmp/outputs/sft_pd
+
+# E2+: DPO on BoN episode-level pairs（BoN+DPO baseline，与 E4 对比）
+python -m src.training.dpo_train \
+    --sft-model /root/autodl-tmp/outputs/sft_bon/final \
+    --dataset data/dpo_dataset/train_bon_episode.jsonl \
+    --output /root/autodl-tmp/outputs/dpo_bon_episode
+
+# E4: DPO on PD turn-level pairs（我们的方法）
+python -m src.training.dpo_train \
+    --sft-model /root/autodl-tmp/outputs/sft_pd/final \
+    --dataset data/dpo_dataset/train.jsonl \
+    --output /root/autodl-tmp/outputs/dpo_pd \
+    --min-score-gap 0.10
+```
+
+### 3. 评估
+
+```bash
+# 终端 1: serve 模型
+vllm serve /root/autodl-tmp/outputs/sft_pd/final \
+    --port 8001 --trust-remote-code --dtype bfloat16
+
+# 终端 2: 评估（retail + airline test split）
+python -m src.evaluation.eval_on_tau_bench \
+    --domain retail airline --split test \
+    --model-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 \
+    --output results/sft_pd_eval.json
+```
 
 ---
 
@@ -277,6 +667,16 @@ python -m src.data_generation.build_dataset
 5. **evaluate_simulation 需要 SimulationRun**：不能直接传 trajectory，要包成 SimulationRun 对象。
 6. **环境 fork 时 user_tools 可能为 None**：retail domain 没有 user tools，代码里已处理（try/except）。
 7. **DPO 格式**：旧代码用 `_candidate_to_text()` 转成字符串，丢失 tool_call 结构，已修复为 `_candidate_to_chatml()`。
+8. **PD 退步 bug（已修复）**：当所有候选 score gap=0 时，PD 仍然注入一个 temperature=0.8 的候选，而不是 greedy（temperature=0.0）的输出，导致在确定性步骤引入噪声，某些 baseline=1.0 的任务 PD 反而变成 0.0。
+   - 修复：在 `_pd_step()` 中，若 `max_score - min_score < 0.05`，自动 fallback 到 greedy（重新生成 1 个 temperature=0.0 的候选）
+   - 受影响的旧数据：task_8（全部 reward=0）已删除重跑；tasks 15、16 有部分成功 trial 可用
+   - 旧数据里 reward=1.0 的文件不受影响（仍可用于 SFT）；DPO 数据不受影响（gap=0 的步骤本来就被过滤）
+9. **Value function gap=0 问题（Session 3 改进）**：H=2 的 foresight 太短，94% 步骤所有候选调同一 tool → score 完全相同。根本原因是旧信号（env_assertions, action_overlap）不区分 foresight delta。新的 delta-based 信号（delta_progress, health, sentiment）直接在 foresight 窗口内计算，有效区分候选。
+10. **DASHSCOPE_API_KEY 在 kill 进程后丢失**：kill 后台进程时环境变量丢失。重新启动时用 `DASHSCOPE_API_KEY=xxx nohup python3.11 ...` 直接传入，不依赖 export。
+11. **SFTTrainer 的 messages 列处理**：TRL 的 SFTTrainer 不能直接处理包含 tool_calls 的 messages 列（版本依赖问题）。正确做法：先用 `tokenizer.apply_chat_template()` 转为文本，再用 `dataset_text_field="text"`。
+12. **DPO ref_model 内存**：同时加载 model 和 ref_model 需要 32GB（16GB×2），在 32GB 显卡上无法容纳激活值。使用 `ref_model=None` + PEFT 配置，TRL 自动用禁用 LoRA 的基模型作参考，节省 16GB。A100 40GB 可以显式加载 ref_model，但 `ref_model=None` 在任何显卡上都是更优方案。
+13. **build_dataset.py 必须分域处理**：retail 和 airline 的 task ID 有 27 个重叠（0-49 范围内）。如果合并 allowed_ids 再过滤，retail 测试集的某些 task 会因为恰好与 airline 训练集 ID 相同而被错误纳入。修复：main() 现在按 domain 循环，每个 domain 独立构建后 append 合并。
+14. **BoN SFT 数据不要只用 oracle best**：旧代码从 `_bon_summary.json` 的 `best_conversation` 只取 1 条/task，导致 retail 仅 61 条。所有成功的 `_bon_n*.json` 都可以用，retail 有 196 条。修复后 E2 和 E3 数据量更可比（295 vs 197）。
 
 ---
 

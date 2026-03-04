@@ -77,6 +77,9 @@ def run_bon_episode(
     conversation = _extract_conversation(orch)
     wall_time_s = time.time() - episode_start
 
+    from src.predictive_decoding.core import _sum_usage
+    traj_usage = _sum_usage(orch.get_trajectory())
+
     return {
         "task_id": task.id,
         "conversation": conversation,
@@ -86,7 +89,7 @@ def run_bon_episode(
         ),
         "num_steps": step_count,
         "wall_time_s": round(wall_time_s, 2),
-        "api_calls_approx": step_count * 2,
+        "tokens": traj_usage,
         "source": "bon_sample",
     }
 
@@ -140,7 +143,6 @@ def run_bon_task(
     if not samples:
         raise RuntimeError(f"All {N} BoN samples failed for task {task.id}")
 
-    # Oracle: best reward among N samples
     best_sample = max(samples, key=lambda s: s["final_reward"])
     oracle_reward = best_sample["final_reward"]
     avg_reward = sum(s["final_reward"] for s in samples) / len(samples)
@@ -148,7 +150,12 @@ def run_bon_task(
 
     wall_time_s = time.time() - task_start
 
-    # Save BoN summary (includes the best trajectory for SFT use)
+    # Sum token usage across all N samples
+    from src.predictive_decoding.core import _sum_usage, _add_usage, _ZERO_USAGE
+    total_tokens = dict(_ZERO_USAGE)
+    for s in samples:
+        total_tokens = _add_usage(total_tokens, s.get("tokens", _ZERO_USAGE))
+
     summary = {
         "task_id": task.id,
         "N": N,
@@ -159,7 +166,7 @@ def run_bon_task(
         "best_conversation": best_sample["conversation"],
         "best_termination_reason": best_sample["termination_reason"],
         "wall_time_s": round(wall_time_s, 2),
-        "api_calls_approx": total_api_calls,
+        "tokens": total_tokens,
         "source": "bon",
     }
 

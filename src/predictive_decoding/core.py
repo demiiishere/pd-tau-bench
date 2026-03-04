@@ -31,6 +31,29 @@ from src.predictive_decoding.tau_bench_adapter import (
 from src.predictive_decoding.value_function import compute_value
 
 
+def _sum_usage(messages) -> dict:
+    """Sum prompt_tokens and completion_tokens from a list of messages."""
+    p, c = 0, 0
+    for msg in messages:
+        u = getattr(msg, "usage", None)
+        if u and isinstance(u, dict):
+            p += u.get("prompt_tokens", 0) or 0
+            c += u.get("completion_tokens", 0) or 0
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _add_usage(a: dict, b: dict) -> dict:
+    """Add two usage dicts together."""
+    return {
+        "prompt_tokens": a["prompt_tokens"] + b["prompt_tokens"],
+        "completion_tokens": a["completion_tokens"] + b["completion_tokens"],
+        "total_tokens": a["total_tokens"] + b["total_tokens"],
+    }
+
+
+_ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
 def run_pd_episode(
     orchestrator: Orchestrator,
     task: Task,
@@ -63,7 +86,8 @@ def run_pd_episode(
 
     steps = []  # PD decision records for each agent turn
     pd_steps_count = 0
-    pd_steps_skipped_count = 0  # Steps where all candidates were identical → skipped PD
+    pd_steps_skipped_count = 0   # Steps skipped: all candidates near-identical text
+    pd_steps_greedy_fb_count = 0  # Steps using greedy fallback: gap < threshold
 
     step_count = 0
     while not orchestrator.done and step_count < max_steps:
@@ -87,6 +111,8 @@ def run_pd_episode(
             pd_steps_count += 1
             if step_record.get("skipped_identical"):
                 pd_steps_skipped_count += 1
+            if step_record.get("greedy_fallback"):
+                pd_steps_greedy_fb_count += 1
             # After _pd_step, the orchestrator has advanced past the agent turn
         else:
             # Non-agent turn: just step normally (user response, tool call execution)
@@ -107,13 +133,17 @@ def run_pd_episode(
 
     wall_time_s = time.time() - episode_start
 
-    # Estimate API calls: each PD step makes K candidate calls + K*H foresight calls
-    # Skipped steps only made K calls (no foresight). Non-PD steps make ~2 calls (agent+user).
-    non_pd_steps = step_count - pd_steps_count
-    api_calls_approx = (
-        sum(s.get("api_calls_approx", 0) for s in steps)
-        + non_pd_steps * 2
-    )
+    # Token usage breakdown:
+    #   episode_tokens  = tokens in the actual final trajectory (what becomes training data)
+    #   overhead_tokens = tokens spent on PD exploration (candidate gen + foresight),
+    #                     i.e. the cost of lookahead that doesn't appear in the trajectory
+    #   total_tokens    = episode + overhead
+    episode_usage = _sum_usage(orchestrator.get_trajectory())
+    overhead_usage = dict(_ZERO_USAGE)
+    for s in steps:
+        u = s.get("token_usage_overhead", _ZERO_USAGE)
+        overhead_usage = _add_usage(overhead_usage, u)
+    total_usage = _add_usage(episode_usage, overhead_usage)
 
     return {
         "task_id": task.id,
@@ -126,9 +156,14 @@ def run_pd_episode(
             else "unknown"
         ),
         "wall_time_s": round(wall_time_s, 2),
-        "api_calls_approx": api_calls_approx,
+        "tokens": {
+            "episode": episode_usage,
+            "overhead": overhead_usage,
+            "total": total_usage,
+        },
         "pd_steps_count": pd_steps_count,
         "pd_steps_skipped_count": pd_steps_skipped_count,
+        "pd_steps_greedy_fb_count": pd_steps_greedy_fb_count,
         "source": "pd",
     }
 
@@ -159,7 +194,7 @@ def _pd_step(
     conversation_snapshot = deepcopy(orchestrator.trajectory)
 
     # ── Step 1: Generate K candidate responses (with adaptive temperature) ────
-    candidates = _generate_candidates(
+    candidates, cand_usage = _generate_candidates(
         orchestrator=orchestrator,
         incoming_message=incoming_message,
         K=K,
@@ -167,7 +202,6 @@ def _pd_step(
     )
 
     # ── Optimization: Skip PD if all candidates are near-identical ────────────
-    # (happens when the step is highly deterministic, e.g. a required tool call)
     if _candidates_are_identical(candidates, threshold=0.95):
         restore_orchestrator_state(orchestrator, saved_state)
         _inject_agent_response(orchestrator, incoming_message, candidates[0])
@@ -179,15 +213,17 @@ def _pd_step(
             "chosen_idx": 0,
             "chosen_action": _msg_to_dict(candidates[0]),
             "skipped_identical": True,
-            "api_calls_approx": len(candidates),  # Only candidate generation, no foresight
+            "greedy_fallback": False,
+            # overhead = candidate generation only (no foresight for skipped steps)
+            "token_usage_overhead": cand_usage,
         }
 
     # ── Step 2 & 3: Foresight rollout + scoring for each candidate ────────────
     candidate_scores = []
-    total_foresight_steps = 0
+    foresight_usage = dict(_ZERO_USAGE)
     for i, candidate in enumerate(candidates):
         restore_orchestrator_state(orchestrator, saved_state)
-        score, fs = _evaluate_candidate(
+        score, fs_usage = _evaluate_candidate(
             orchestrator=orchestrator,
             task=task,
             incoming_message=incoming_message,
@@ -196,14 +232,66 @@ def _pd_step(
             foresight_temperature=foresight_temperature,
         )
         candidate_scores.append(score)
-        total_foresight_steps += fs
+        foresight_usage = _add_usage(foresight_usage, fs_usage)
         logger.debug(f"  Candidate {i}: score={score:.3f} | {_preview(candidate)}")
 
     # ── Step 4: Pick best candidate ───────────────────────────────────────────
     best_idx = max(range(len(candidate_scores)), key=lambda i: candidate_scores[i])
+    score_gap = max(candidate_scores) - min(candidate_scores)
+
+    # Total overhead so far: all K candidates + all foresight
+    # (the chosen candidate's tokens will also appear in episode_tokens via trajectory,
+    #  so we subtract them from overhead to avoid double-counting)
+    chosen_cand_usage = _sum_usage([candidates[best_idx]])
+    overhead_this_step = _add_usage(cand_usage, foresight_usage)
+    overhead_this_step = {
+        "prompt_tokens": overhead_this_step["prompt_tokens"] - chosen_cand_usage["prompt_tokens"],
+        "completion_tokens": overhead_this_step["completion_tokens"] - chosen_cand_usage["completion_tokens"],
+        "total_tokens": overhead_this_step["total_tokens"] - chosen_cand_usage["total_tokens"],
+    }
+
+    # ── Greedy fallback when gap is negligible ────────────────────────────────
+    GREEDY_FALLBACK_THRESHOLD = 0.05
+    if score_gap < GREEDY_FALLBACK_THRESHOLD:
+        restore_orchestrator_state(orchestrator, saved_state)
+        greedy_list, greedy_usage = _generate_candidates(
+            orchestrator=orchestrator,
+            incoming_message=incoming_message,
+            K=1,
+            temperature=0.0,
+        )
+        greedy = greedy_list[0]
+        _inject_agent_response(orchestrator, incoming_message, greedy)
+        logger.debug(
+            f"PD step GREEDY FALLBACK: gap={score_gap:.3f} < {GREEDY_FALLBACK_THRESHOLD}"
+        )
+        # Overhead = all K exploration candidates + foresight + greedy gen
+        # (greedy will appear in trajectory so subtract it from overhead)
+        fb_overhead = _add_usage(
+            _add_usage(cand_usage, foresight_usage), greedy_usage
+        )
+        greedy_cand_usage = _sum_usage([greedy])
+        fb_overhead = {
+            "prompt_tokens": fb_overhead["prompt_tokens"] - greedy_cand_usage["prompt_tokens"],
+            "completion_tokens": fb_overhead["completion_tokens"] - greedy_cand_usage["completion_tokens"],
+            "total_tokens": fb_overhead["total_tokens"] - greedy_cand_usage["total_tokens"],
+        }
+        return {
+            "conversation_history": [_msg_to_dict(m) for m in conversation_snapshot],
+            "candidates": [_msg_to_dict(c) for c in candidates],
+            "scores": candidate_scores,
+            "chosen_idx": -1,
+            "chosen_action": _msg_to_dict(greedy),
+            "skipped_identical": False,
+            "greedy_fallback": True,
+            "score_gap": score_gap,
+            "token_usage_overhead": fb_overhead,
+        }
+
     chosen = candidates[best_idx]
     logger.info(
-        f"PD step: chose candidate {best_idx} (score={candidate_scores[best_idx]:.3f})"
+        f"PD step: chose candidate {best_idx} (score={candidate_scores[best_idx]:.3f}, "
+        f"gap={score_gap:.3f})"
     )
 
     # ── Step 5: Restore state and inject the chosen candidate ─────────────────
@@ -217,7 +305,9 @@ def _pd_step(
         "chosen_idx": best_idx,
         "chosen_action": _msg_to_dict(chosen),
         "skipped_identical": False,
-        "api_calls_approx": len(candidates) + total_foresight_steps,
+        "greedy_fallback": False,
+        "score_gap": score_gap,
+        "token_usage_overhead": overhead_this_step,
     }
 
 
@@ -226,16 +316,17 @@ def _generate_candidates(
     incoming_message,
     K: int,
     temperature: float,
-) -> list[AssistantMessage]:
+) -> tuple[list[AssistantMessage], dict]:
     """
     Generate K diverse candidate responses from the agent LLM.
-    Uses adaptive temperature: if early candidates are too similar, raises temp
-    to encourage diversity.
+    Uses adaptive temperature: if early candidates are too similar, raises temp.
+
+    Returns:
+        (candidates, usage) where usage = sum of token usage across all K calls.
     """
     agent: LLMAgent = orchestrator.agent
     agent_state = orchestrator.agent_state
 
-    # Build the message list the agent would see
     if isinstance(incoming_message, MultiToolMessage):
         history = list(agent_state.messages) + list(incoming_message.tool_messages)
     else:
@@ -246,7 +337,6 @@ def _generate_candidates(
     candidates = []
     current_temp = temperature
     for i in range(K):
-        # Adaptive temperature: if previous candidates are too similar, raise temp
         if i >= 2:
             current_temp = _adaptive_temperature(candidates, base_temp=temperature)
 
@@ -260,7 +350,6 @@ def _generate_candidates(
             candidates.append(candidate)
         except Exception as e:
             logger.warning(f"Failed to generate candidate {i} (temp={current_temp:.2f}): {e}")
-            # Fall back to base temperature
             try:
                 candidate = generate(
                     model=agent.llm,
@@ -275,7 +364,8 @@ def _generate_candidates(
     if not candidates:
         raise RuntimeError("No candidates generated. Check API connectivity.")
 
-    return candidates
+    usage = _sum_usage(candidates)
+    return candidates, usage
 
 
 def _adaptive_temperature(
@@ -351,39 +441,38 @@ def _evaluate_candidate(
     candidate: AssistantMessage,
     H: int,
     foresight_temperature: float,
-) -> tuple[float, int]:
+) -> tuple[float, dict]:
     """
     Evaluate a candidate by injecting it and running H foresight turns.
-    Returns (value_score, foresight_steps_taken).
+    Returns (value_score, foresight_token_usage).
+
+    foresight_token_usage includes the injected candidate itself plus all
+    messages generated during the H foresight steps.
     """
-    # Set greedy temperature for foresight
     original_temp = orchestrator.agent.llm_args.get("temperature", 0.0)
     set_agent_temperature(orchestrator, foresight_temperature)
 
-    foresight_steps = 0
+    traj_len_before = len(orchestrator.trajectory)
     try:
-        # Inject the candidate as the agent's response
         _inject_agent_response(orchestrator, incoming_message, candidate)
 
-        # Run H more turns (or until done), counting non-ENV steps
         for _ in range(H):
             if orchestrator.done:
                 break
             try:
                 orchestrator.step()
-                if orchestrator.to_role != Role.ENV:
-                    foresight_steps += 1
             except Exception as e:
                 logger.warning(f"Foresight step failed: {e}")
                 break
 
-        # Score the resulting state
-        score = compute_value(orchestrator, task)
+        score = compute_value(orchestrator, task, foresight_start_idx=traj_len_before)
+        # Sum usage from all new messages added during this foresight evaluation
+        new_messages = orchestrator.trajectory[traj_len_before:]
+        usage = _sum_usage(new_messages)
     finally:
-        # Always restore temperature
         set_agent_temperature(orchestrator, original_temp)
 
-    return score, foresight_steps
+    return score, usage
 
 
 def _inject_agent_response(

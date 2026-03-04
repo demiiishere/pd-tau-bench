@@ -77,13 +77,17 @@ def run_one_trial(
     with open(pd_path, "w", encoding="utf-8") as f:
         json.dump(pd_result, f, indent=2, ensure_ascii=False)
 
+    pd_tokens = pd_result.get("tokens", {})
     result = {
         "task_id": task.id,
         "trial": trial,
         "pd_reward": pd_result["final_reward"],
         "pd_time_s": pd_result.get("wall_time_s", 0),
-        "pd_api_calls": pd_result.get("api_calls_approx", 0),
+        "pd_tokens_total": pd_tokens.get("total", {}).get("total_tokens", 0),
+        "pd_tokens_episode": pd_tokens.get("episode", {}).get("total_tokens", 0),
+        "pd_tokens_overhead": pd_tokens.get("overhead", {}).get("total_tokens", 0),
         "pd_steps_skipped": pd_result.get("pd_steps_skipped_count", 0),
+        "pd_steps_greedy_fb": pd_result.get("pd_steps_greedy_fb_count", 0),
     }
 
     # Baseline trajectory (trial 0 only to save API cost)
@@ -191,13 +195,17 @@ def main():
                 result = future.result()
                 pd_r = result.get("pd_reward", "?")
                 bl_r = result.get("baseline_reward", "-")
+                tok_total = result.get("pd_tokens_total", 0)
+                tok_ep = result.get("pd_tokens_episode", 0)
+                tok_oh = result.get("pd_tokens_overhead", 0)
                 skipped = result.get("pd_steps_skipped", 0)
-                api_c = result.get("pd_api_calls", 0)
-                total_api_calls += api_c
+                greedy_fb = result.get("pd_steps_greedy_fb", 0)
+                total_api_calls += tok_total
                 logger.info(
                     f"[{domain}] Task {task.id} trial {trial}: "
                     f"PD={pd_r}, baseline={bl_r}, "
-                    f"api_calls≈{api_c}, skipped_steps={skipped}"
+                    f"tokens={tok_total} (ep={tok_ep}+oh={tok_oh}), "
+                    f"skipped={skipped}, greedy_fb={greedy_fb}"
                 )
                 successes += 1
             except Exception as e:

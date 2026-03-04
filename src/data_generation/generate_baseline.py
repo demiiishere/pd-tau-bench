@@ -69,8 +69,8 @@ def run_baseline_episode(
     conversation = _extract_conversation(orch)
     wall_time_s = time.time() - episode_start
 
-    # Each non-ENV step involves ~2 API calls (agent + user)
-    api_calls_approx = step_count * 2
+    from src.predictive_decoding.core import _sum_usage
+    traj_usage = _sum_usage(orch.get_trajectory())
 
     return {
         "task_id": task.id,
@@ -81,7 +81,7 @@ def run_baseline_episode(
         ),
         "num_steps": step_count,
         "wall_time_s": round(wall_time_s, 2),
-        "api_calls_approx": api_calls_approx,
+        "tokens": traj_usage,
         "source": "baseline",
     }
 
@@ -144,10 +144,13 @@ def main():
             reward = result["final_reward"]
             successes += int(reward == 1.0)
             total_time += result["wall_time_s"]
+            tok = result.get("tokens", {})
             logger.info(
                 f"  reward={reward}, steps={result['num_steps']}, "
                 f"time={result['wall_time_s']:.1f}s, "
-                f"api_calls≈{result['api_calls_approx']}, "
+                f"tokens={tok.get('total_tokens','?')} "
+                f"(prompt={tok.get('prompt_tokens','?')}, "
+                f"completion={tok.get('completion_tokens','?')}), "
                 f"termination={result['termination_reason']}"
             )
         except Exception as e:
