@@ -450,26 +450,30 @@ python -m src.training.dpo_train \
 
 ### 7. 运行评估
 
-评估流程：先用 vLLM serve 微调后的模型，再跑 eval 脚本。
+**服务器无外网，评估在本地 Mac 上跑**（服务器只负责 vLLM serving）。
 
 ```bash
-# 终端 1：启动 vLLM server（占用 GPU）
-vllm serve /root/autodl-tmp/outputs/sft_pd/final \
-    --port 8001 \
-    --trust-remote-code \
-    --dtype bfloat16
+# 服务器：后台启动 vLLM（无需外网）
+nohup vllm serve /root/autodl-tmp/outputs/sft_bon/final \
+    --served-model-name finetuned \
+    --port 8001 --trust-remote-code --dtype bfloat16 \
+    > vllm.log 2>&1 &
 
-# 终端 2：跑评估（用 test split，5 次 trial 取平均）
+# 本地 Mac：建 SSH 隧道（AutoDL 查看实例信息获取 ip 和 port）
+ssh -L 8001:localhost:8001 root@<server_ip> -p <port>
+
+# 本地 Mac：跑评估（agent 走 SSH 隧道→vLLM，user simulator 走 DashScope）
 python -m src.evaluation.eval_on_tau_bench \
-    --domain retail \
+    --domain retail airline \
     --split test \
-    --model-url http://localhost:8001/v1 \
+    --agent-model finetuned \
+    --vllm-url http://localhost:8001/v1 \
     --user-model openai/qwen-plus \
-    --num-trials 5 \
-    --output results/sft_pd_eval.json
+    --num-trials 3 \
+    --output-dir outputs/results/sft_bon
 ```
 
-E1（zero-shot baseline）把 `--model-url` 指向未微调的 Qwen3-8B 即可。
+评估脚本已修复 3 个 bug（见 PROGRESS.md Session 6）。输出 `summary.json` 含 pass@1、pass@k（all succeed）、oracle（any succeed）。
 
 ### 常见坑（服务器专属）
 

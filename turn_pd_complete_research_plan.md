@@ -491,11 +491,13 @@ Abstract
 
 优先级顺序：
 [ ] E0: 评估 Qwen3-8B 零样本 baseline（在 test split 上，无需训练）
-[ ] E2: SFT on BoN 295 条 → 评估 retail+airline test split（先跑做 debug）
-[ ] E3: SFT on PD 197 条 → 评估 test split（核心实验）
+[x] E2: SFT on BoN 295 条（train_loss=0.9648, eval_loss=0.8485, token_acc=0.7801）→ 待评估
+[x] E3: SFT on PD 197 条（train_loss=1.010,  eval_loss=0.7797, token_acc=0.8038）→ 待评估
 [ ] E1: SFT on standard 61 条 → 评估 test split
 [ ] E2+: E2 → DPO on BoN episode-level pairs → 评估 test split
 [ ] E4: E3 → DPO on PD turn-level 313 对 → 评估 test split（我们的方法）
+
+评估方式：服务器跑 vLLM（nohup 后台），本地 Mac 通过 SSH 隧道连接（见 CLAUDE_CONTEXT.md 服务器评估小节）。
 
 核心对比：E2+ vs E4（turn-level vs episode-level DPO）
 [ ] L0/L3/L4: Llama 底座泛化实验（视时间）

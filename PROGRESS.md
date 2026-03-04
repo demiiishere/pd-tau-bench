@@ -2,8 +2,8 @@
 
 ## TL;DR
 
-**Phase A 完成，训练策略已确定，准备上服务器跑 Phase B。**
-核心策略：小数据体制 (r=8, q/v-only LoRA, 1 epoch) + 通用数据混合 + 新增 E2+ (BoN+episode-DPO) 与 E4 (PD+turn-DPO) 对比。
+**Phase B 进行中：E2 (BoN) 和 E3 (PD) SFT 训练已完成，准备跑评估。**
+评估策略：服务器跑 vLLM（无需外网），本地 Mac 通过 SSH 隧道连接 vLLM + 直接调 DashScope API。
 
 | | retail | airline | 合计 |
 |--|--|--|--|
@@ -39,6 +39,47 @@ PD pass@1：retail 55.4%，airline 62.7%（均高于同 domain BoN pass@1）
 | 轨迹质量检查 | `src/data_generation/inspect_trajectories.py` | ✅ 正常 |
 | Phase B 训练框架 | `src/training/sft_train.py` + `dpo_train.py` | ✅ 脚本已修复，等 GPU |
 | Phase B 评估框架 | `src/evaluation/eval_on_tau_bench.py` + `analysis.py` | ✅ 框架已写，等 GPU |
+
+### Session 6 更新（2026-03-04）— E2/E3 SFT 训练完成，评估脚本修复
+
+#### 1. SFT 训练结果（服务器 A100，1 epoch，LoRA r=8，q/v only）
+
+| 实验 | train_loss | eval_loss | token_accuracy | 训练时间 |
+|------|-----------|-----------|---------------|---------|
+| E2 (BoN, 295条) | 0.9648 | 0.8485 | 0.7801 | ~168s |
+| E3 (PD, 197条) | 1.010 | 0.7797 | 0.8038 | ~112s |
+
+PD 的 eval_loss 更低、token_accuracy 更高，说明 PD 轨迹质量确实更高（模型更容易学习）。
+
+#### 2. 评估脚本修复（`src/evaluation/eval_on_tau_bench.py` 3 个 bug）
+
+- **Bug 1（最严重）**：没用 `load_task_split()`，会跑全部任务而非 test split → 已修复
+- **Bug 2**：pass@k 算的是 `any`（oracle），应为 `all` → 已修复；新增 oracle 字段保留两者
+- **Bug 3**：模型路由冲突，agent 和 user simulator 都被路由到 vLLM → 已修复，改为 `agent_model_args` 传 `api_base`/`api_key` per-call override
+
+`generate_baseline.py` 新增 `agent_model_args` 参数支持上述 per-call override。
+
+#### 3. 评估策略：本地 Mac 通过 SSH 隧道
+
+服务器无外网，DashScope API 无法从服务器调用。解决方案：
+
+```bash
+# 本地 Mac：建 SSH 隧道，把服务器 8001 端口转发到本地
+ssh -L 8001:localhost:8001 root@<server_ip> -p <port>
+
+# 服务器：启动 vLLM（无需外网，只监听本机端口）
+vllm serve /root/autodl-tmp/outputs/sft_bon/final \
+    --served-model-name finetuned --port 8001 \
+    --trust-remote-code --dtype bfloat16
+
+# 本地 Mac：跑评估（agent → SSH隧道→vLLM，user → DashScope直连）
+python -m src.evaluation.eval_on_tau_bench \
+    --domain retail airline --split test \
+    --agent-model finetuned \
+    --vllm-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 --output-dir outputs/results/sft_bon
+```
 
 ### Session 5 更新（2026-03-04）— Phase B 训练策略确定
 

@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -43,16 +44,22 @@ def run_baseline_episode(
     user_model: str,
     temperature: float = 0.0,
     max_steps: int = 30,
+    agent_model_args: Optional[dict] = None,
 ) -> dict:
     """Run a single episode with standard greedy decoding."""
     episode_start = time.time()
+
+    if agent_model_args is None:
+        agent_model_args = {"temperature": temperature}
+    else:
+        agent_model_args = {"temperature": temperature, **agent_model_args}
 
     orch = create_orchestrator(
         domain=domain,
         task=task,
         agent_model=agent_model,
         user_model=user_model,
-        agent_model_args={"temperature": temperature},
+        agent_model_args=agent_model_args,
         user_model_args={"temperature": 0.0},
         max_steps=max_steps,
     )
