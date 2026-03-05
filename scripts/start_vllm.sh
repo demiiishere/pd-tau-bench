@@ -20,6 +20,7 @@ fi
 echo "Starting vLLM: model=${VARIANT}, lora=${LORA_PATH}, port=${PORT}"
 echo "Log: ${LOG_FILE}"
 
+eval "$(conda shell.bash hook)"
 conda activate vllm-env
 
 nohup vllm serve "${BASE_MODEL}" \
