@@ -481,30 +481,34 @@ Abstract
 [ ] 在变体任务上跑 PD + baseline 生成轨迹
 ```
 
-### Phase B：训练（租 GPU）
+### Phase B：训练 + 评估
+
+**服务器：公司 Teleport 服务器**（SSH Host: `devspace-zhujiatong-pad-alter-193739`，2× H100 80GB）
+**评估方式：VS Code PORTS 面板端口转发 → 本地 Mac 跑评估**（服务器无外网，SSH 隧道不通）
+详细操作流程见 `CLAUDE_CONTEXT.md` → "7. 运行评估（完整步骤）"
 
 ```
-[ ] 租 GPU 服务器（AutoDL A100-40G 或同等）
-[ ] 配置服务器环境（conda, transformers, trl, peft, vllm）
-[ ] 下载 Qwen3-8B 模型（hf-mirror.com，约 16GB）
-[ ] 上传数据集（data/sft_dataset/ + data/dpo_dataset/）
+[x] 服务器环境已配置（vllm-env conda 环境，vLLM 0.16.0，2× H100）
+[x] Qwen3-8B 模型已就绪：/user/zhujiatong/models/Qwen3-8B
+[x] 数据集已上传
 
 优先级顺序：
-[ ] E0: 评估 Qwen3-8B 零样本 baseline（在 test split 上，无需训练）
-[x] E2: SFT on BoN 295 条（70 steps, eval_loss=0.8485, token_acc=0.7801）→ 待评估 | outputs_pd/sft_bon/final/
-[x] E3: SFT on PD  197 条（47 steps, eval_loss=0.7797, token_acc=0.8038）→ 待评估 | outputs_pd/sft_pd/final/
+[ ] E0: 评估 Qwen3-8B 零样本 baseline（test split，无需训练）
+[x] E2: SFT on BoN 295 条（70 steps, eval_loss=0.8485, token_acc=0.7801）
+      → 进行中评估 | 服务器路径: /user/zhujiatong/outputs_pd/sft_bon/final/
+      → 启动: bash scripts/start_vllm.sh bon
+[x] E3: SFT on PD  197 条（47 steps, eval_loss=0.7797, token_acc=0.8038）
+      → 待评估 | 服务器路径: /user/zhujiatong/outputs_pd/sft_pd/final/
+      → 启动: bash scripts/start_vllm.sh pd
 [ ] E1: SFT on standard 61 条 → 评估 test split
 [ ] E2+: E2 → DPO on BoN episode-level pairs → 评估 test split
 [ ] E4: E3 → DPO on PD turn-level 313 对 → 评估 test split（我们的方法）
-
-评估方式：服务器跑 vLLM（nohup 后台），本地 Mac 通过 SSH 隧道连接（见 CLAUDE_CONTEXT.md 服务器评估小节）。
 
 核心对比：E2+ vs E4（turn-level vs episode-level DPO）
 [ ] L0/L3/L4: Llama 底座泛化实验（视时间）
 [ ] 关键 ablation: A3 (SFT vs DPO) 和 A6 (Turn-PD vs BoN，成本匹配)
 [ ] 其余 ablation 按优先级做
 [ ] BFCL 评估（所有模型，必须做）
-[ ] τ²-bench telecom 评估（如果时间允许）
 ```
 
 ### Phase C：分析和写作

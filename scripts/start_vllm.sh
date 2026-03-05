@@ -29,6 +29,7 @@ nohup vllm serve "${BASE_MODEL}" \
     --port "${PORT}" \
     --trust-remote-code \
     --dtype bfloat16 \
+    --max-model-len 65536 \
     --enable-auto-tool-choice \
     --tool-call-parser hermes \
     > "${LOG_FILE}" 2>&1 &

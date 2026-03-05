@@ -2,14 +2,17 @@
 
 > 给下一个 Claude 实例在继续工作前阅读的技术备忘录。
 >
-> **本地 Mac（Phase A 数据生成）**
+> **本地 Mac（数据生成 + 评估）**
 > 项目路径：`/Users/zhujiatong/pd-tau-bench/`
 > Conda 环境：`pd-tau-bench`（用 `python3.11`，没有 `python` 软链接）
 > API Key：存在用户的 shell 环境变量 `DASHSCOPE_API_KEY` 里（每次对话重新设置）
 >
-> **GPU 服务器（Phase B 训练+评估）**
-> AutoDL A100-PCIE-40GB，项目在 `/root/autodl-tmp/pd-tau-bench/`
-> 环境配置见下方"服务器环境配置"小节
+> **GPU 服务器（训练 + vLLM serving）**
+> 公司 Teleport 服务器（非 AutoDL），SSH Host: `devspace-zhujiatong-pad-alter-193739`
+> 通过 VS Code Remote SSH 连接（tsh ProxyCommand）
+> 项目路径：`/user/zhujiatong/pd-tau-bench/`
+> vLLM conda 环境：`vllm-env`（与训练环境分开）
+> GPU：2× H100 80GB
 
 ---
 
@@ -329,98 +332,18 @@ python -m src.data_generation.generate_bon \
 
 ---
 
-## 服务器环境配置（AutoDL A100 40GB，Phase B）
+## 服务器环境配置（公司 Teleport 服务器，2× H100 80GB）
 
-> 本节给在 GPU 服务器上首次开启的 Claude 实例看。本地 Mac 不需要这些步骤。
+> 本节给在 GPU 服务器上操作的 Claude 实例看。
 
-### 0. AutoDL 开机镜像选择
+### 服务器基本信息
 
-开实例时选：**PyTorch 2.x / CUDA 12.8（或 12.4）/ Python 3.10（或 3.11）**。
-优先选 12.8（驱动更新，支持更新的 wheel）；12.4 也完全够用。不要选 TensorFlow 镜像。
-
-### 1. 上传项目文件
-
-```bash
-# 本地执行：把整个项目压缩后上传（排除不必要的大文件）
-tar --exclude='./data/raw_trajectories' \
-    --exclude='./.git' \
-    --exclude='./tau2-bench/.git' \
-    -czf pd-tau-bench.tar.gz .
-
-# 用 AutoDL 的文件上传功能，或：
-scp -P <port> pd-tau-bench.tar.gz root@<ip>:/root/autodl-tmp/
-
-# 服务器上解压
-cd /root/autodl-tmp
-tar -xzf pd-tau-bench.tar.gz -C pd-tau-bench
-cd pd-tau-bench
-```
-
-> **注意**：AutoDL 的 `/root/autodl-tmp` 是高速 SSD，数据和模型都放这里。
-> `/root` 本身空间很小，不要在那里存大文件。
-
-### 2. 上传数据集
-
-把本地 `data/sft_dataset/` 和 `data/dpo_dataset/` 上传到服务器同路径：
-
-```bash
-# 本地执行
-scp -P <port> -r data/sft_dataset data/dpo_dataset root@<ip>:/root/autodl-tmp/pd-tau-bench/data/
-```
-
-### 3. 安装 Python 依赖
-
-```bash
-# 创建 conda 环境（如果镜像已有 python 3.11 也可以直接用）
-conda create -n pd-tau-bench python=3.11 -y
-conda activate pd-tau-bench
-
-# 用清华镜像加速 pip
-pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
-
-# 训练依赖
-# CUDA 12.8（AutoDL 推荐选项）
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-# 如果 cu128 wheels 还没发布，cu124 在 12.8 驱动上也能跑（12.x 向后兼容）
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install transformers>=4.45 trl>=0.9 peft>=0.12 datasets>=2.20 accelerate>=0.33
-pip install bitsandbytes loguru  # bitsandbytes 备用，当前脚本不用量化
-
-# 评估依赖（serving 微调后的模型）
-pip install vllm
-
-# tau2-bench（评估时需要，tau2 是我们用的 benchmark 框架）
-cd tau2-bench
-pip install -e .
-cd ..
-```
-
-### 4. 下载 Qwen3-8B 模型（国内用镜像）
-
-```bash
-# 设置 HuggingFace 镜像（国内服务器必须）
-export HF_ENDPOINT=https://hf-mirror.com
-
-# 下载到 autodl-tmp（大约 16GB）
-pip install huggingface_hub
-huggingface-cli download Qwen/Qwen3-8B \
-    --local-dir /root/autodl-tmp/models/Qwen3-8B \
-    --local-dir-use-symlinks False
-```
-
-### 5. 设置环境变量
-
-```bash
-# DASHSCOPE_API_KEY 用于评估时的 user simulator（调 qwen-plus）
-export DASHSCOPE_API_KEY=sk-xxx
-
-# HF 镜像（每次开机需要重设，或写入 ~/.bashrc）
-export HF_ENDPOINT=https://hf-mirror.com
-
-# 可以写入 ~/.bashrc 让它持久化：
-echo 'export HF_ENDPOINT=https://hf-mirror.com' >> ~/.bashrc
-echo 'export DASHSCOPE_API_KEY=sk-xxx' >> ~/.bashrc
-```
+- SSH Host（VS Code SSH config 里）：`devspace-zhujiatong-pad-alter-193739`
+- 连接方式：**只能通过 VS Code Remote SSH**（Teleport ProxyCommand 不支持 `-N -L` 端口转发）
+- 项目路径：`/user/zhujiatong/pd-tau-bench/`
+- 模型路径：`/user/zhujiatong/models/Qwen3-8B`
+- LoRA 路径：`/user/zhujiatong/outputs_pd/sft_bon/final/` 和 `sft_pd/final/`
+- vLLM conda 环境：`vllm-env`（已配好，直接用）
 
 ### 6. 运行训练
 
@@ -434,60 +357,82 @@ echo 'export DASHSCOPE_API_KEY=sk-xxx' >> ~/.bashrc
 # LoRA: r=8, alpha=16, dropout=0.1, target=q_proj+v_proj
 # base model: /user/zhujiatong/models/Qwen3-8B (服务器路径)
 
-# ── 待跑 ────────────────────────────────────────────────────────
+# ── 待跑（在服务器 VS Code 终端里）────────────────────────────────
+cd /user/zhujiatong/pd-tau-bench
+conda activate pd-tau-bench   # 训练用这个环境（不是 vllm-env）
+
 # E1: SFT on standard
-python -m src.training.sft_train \
-    --model /root/autodl-tmp/models/Qwen3-8B \
+python3.11 -m src.training.sft_train \
+    --model /user/zhujiatong/models/Qwen3-8B \
     --dataset data/sft_dataset/train_baseline.jsonl \
-    --output /root/autodl-tmp/outputs/sft_baseline
+    --output /user/zhujiatong/outputs_pd/sft_baseline
 
 # E2+: DPO on BoN episode-level pairs
-python -m src.training.dpo_train \
-    --sft-model /root/autodl-tmp/outputs/sft_bon/final \
+python3.11 -m src.training.dpo_train \
+    --sft-model /user/zhujiatong/outputs_pd/sft_bon/final \
     --dataset data/dpo_dataset/train_bon_episode.jsonl \
-    --output /root/autodl-tmp/outputs/dpo_bon_episode
+    --output /user/zhujiatong/outputs_pd/dpo_bon_episode
 
 # E4: DPO on PD turn-level pairs（我们的方法）
-python -m src.training.dpo_train \
-    --sft-model /root/autodl-tmp/outputs/sft_pd/final \
+python3.11 -m src.training.dpo_train \
+    --sft-model /user/zhujiatong/outputs_pd/sft_pd/final \
     --dataset data/dpo_dataset/train.jsonl \
-    --output /root/autodl-tmp/outputs/dpo_pd \
+    --output /user/zhujiatong/outputs_pd/dpo_pd \
     --min-score-gap 0.10
 ```
 
-### 7. 运行评估
+### 7. 运行评估（完整步骤）
 
 **服务器无外网，评估在本地 Mac 上跑**（服务器只负责 vLLM serving）。
+**不支持普通 SSH 隧道，使用 VS Code PORTS 面板做端口转发。**
+
+**Step 1：在 VS Code 服务器终端里启动 vLLM**
 
 ```bash
-# 服务器：后台启动 vLLM（无需外网，指向 adapter 路径）
-nohup vllm serve /root/autodl-tmp/outputs/sft_bon/final \
-    --served-model-name finetuned \
-    --port 8001 --trust-remote-code --dtype bfloat16 \
-    > vllm.log 2>&1 &
+cd /user/zhujiatong/pd-tau-bench
+git pull
+conda activate vllm-env
+bash scripts/start_vllm.sh bon   # bon 或 pd，启动对应 LoRA
+# 等 ~30s，看到 "Application startup complete"
+curl http://localhost:8001/v1/models   # 验证：应返回含 "finetuned" 的 JSON
+```
 
-# 本地 Mac：建 SSH 隧道（AutoDL 查看实例信息获取 ip 和 port）
-ssh -L 8001:localhost:8001 root@<server_ip> -p <port>
+**Step 2：在 VS Code 里开端口转发**
 
-# 本地 Mac：跑评估（agent 走 SSH 隧道→vLLM，user simulator 走 DashScope）
-python -m src.evaluation.eval_on_tau_bench \
-    --domain retail airline \
+底部 PORTS 选项卡 → Forward a Port → 输入 `8001`。
+VS Code 会把服务器 8001 端口转发到本地（注意本地端口号，可能不是 8001）。
+
+**Step 3：在本地 Mac 跑评估**
+
+```bash
+conda activate pd-tau-bench
+cd /Users/zhujiatong/pd-tau-bench
+
+# 先验证端口转发（换成 PORTS 面板显示的本地端口）
+curl http://localhost:8001/v1/models
+
+python3.11 -m src.evaluation.eval_on_tau_bench \
+    --domain retail \
     --split test \
-    --agent-model finetuned \
+    --agent-model openai/finetuned \
     --vllm-url http://localhost:8001/v1 \
     --user-model openai/qwen-plus \
     --num-trials 3 \
     --output-dir outputs/results/sft_bon
+# airline 同理
 ```
 
-评估脚本已修复 3 个 bug（见 PROGRESS.md Session 6）。输出 `summary.json` 含 pass@1、pass@k（all succeed）、oracle（any succeed）。
+**路由机制**（eval_on_tau_bench.py 内部）：
+- `OPENAI_API_BASE` = vLLM URL（全局，agent model 走这里）
+- DashScope 凭据通过 `user_model_args` 的 per-call `api_base`/`api_key` 传入 user simulator
+- 评估只在 `--split test` 的任务上进行（retail 34 tasks，airline 15 tasks）
 
 ### 常见坑（服务器专属）
 
-- **vLLM 启动慢**：首次加载模型需要 2-5 分钟，等 `Uvicorn running on...` 出现再跑评估
-- **autodl-tmp 掉电不持久**：关机前把重要产出（模型、结果）同步到对象存储或下载到本地
-- **CUDA OOM**：如果 SFT 时 OOM，先检查是否有其他进程占用 GPU：`nvidia-smi`
-- **HF 下载失败**：确认 `HF_ENDPOINT` 已设置，或手动指定 `--endpoint https://hf-mirror.com`
+- **vLLM 启动慢**：首次加载 Qwen3-8B + LoRA 约需 30-60s，等 `Application startup complete`
+- **普通 `ssh -N -L` 不通**：Teleport ProxyCommand 不支持端口转发，必须用 VS Code PORTS 面板
+- **conda 在 bash 脚本里 activate 失败**：需要先 `eval "$(conda shell.bash hook)"`，`start_vllm.sh` 已处理
+- **VS Code 端口映射到非 8001**：以 PORTS 面板显示的本地端口为准，`--vllm-url` 里改成对应端口
 
 ---
 

@@ -40,6 +40,77 @@ PD pass@1：retail 55.4%，airline 62.7%（均高于同 domain BoN pass@1）
 | Phase B 训练框架 | `src/training/sft_train.py` + `dpo_train.py` | ✅ 脚本已修复，等 GPU |
 | Phase B 评估框架 | `src/evaluation/eval_on_tau_bench.py` + `analysis.py` | ✅ 框架已写，等 GPU |
 
+### Session 7 更新（2026-03-05）— 评估环境调试完成，完整工作流确立
+
+#### 完整评估工作流（每次评估按此步骤执行）
+
+**Step 1：在 VS Code 里连服务器并启动 vLLM**
+
+```bash
+# 在 VS Code 里打开 devspace-zhujiatong-pad-alter-193739，
+# 然后在 VS Code 终端里执行：
+cd /user/zhujiatong/pd-tau-bench
+git pull
+conda activate vllm-env
+bash scripts/start_vllm.sh bon   # 或 pd
+# 等待约 30s，看到 "Application startup complete" 即可
+curl http://localhost:8001/v1/models   # 验证：应返回含 "finetuned" 的 JSON
+```
+
+**Step 2：在 VS Code 里开端口转发**
+
+底部面板 → **PORTS（端口）** 选项卡 → **Forward a Port** → 输入 `8001`。
+注意 VS Code 可能映射到不同的本地端口（如 59827），以 PORTS 面板显示的为准。
+
+**Step 3：在本地 Mac 验证端口转发**
+
+```bash
+curl http://localhost:8001/v1/models   # 若端口映射到其他号，换成对应号
+```
+
+**Step 4：在本地 Mac 跑评估**
+
+```bash
+conda activate pd-tau-bench
+cd /Users/zhujiatong/pd-tau-bench
+
+python3.11 -m src.evaluation.eval_on_tau_bench \
+    --domain retail \
+    --split test \
+    --agent-model openai/finetuned \
+    --vllm-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 \
+    --output-dir outputs/results/sft_bon
+# airline 同理，换 --domain airline --output-dir outputs/results/sft_bon_airline
+```
+
+#### 本次调试记录的问题与修复
+
+1. **SSH 隧道方案失败**：Teleport ProxyCommand 不支持 `-N -L` 端口转发 → **改用 VS Code PORTS 面板端口转发**（VS Code 的连接本身就是 SSH，自带端口转发能力）
+
+2. **脚本路径错误**：`scripts/start_vllm.sh` 中 `conda activate` 在非交互 bash 里报错（需要先 init）
+   → 修复：改为 `eval "$(conda shell.bash hook)" && conda activate vllm-env`
+
+3. **评估脚本路由冲突（最终修复）**：
+   - 旧方案：`OPENAI_API_BASE=DashScope`（全局），agent 用 per-call `api_base=vLLM` override → 502（edge case 不生效）
+   - 新方案（inverse pattern）：`OPENAI_API_BASE=vLLM`（全局，agent 走这里），DashScope 凭据通过 `user_model_args` 的 per-call `api_base`/`api_key` 传入 → 路由完全可控
+
+4. **`generate_baseline.py` 新增 `user_model_args` 参数**：配合上述路由修复，让 user simulator 能指定 DashScope 凭据
+
+5. **新增 `scripts/start_vllm.sh`**：封装 vLLM 启动命令，支持 `bon`/`pd` 两个变体，避免每次手打长命令
+
+#### 服务器信息（公司 Teleport 服务器，非 AutoDL）
+
+- SSH host：`devspace-zhujiatong-pad-alter-193739`（VS Code SSH config 里）
+- 项目路径：`/user/zhujiatong/pd-tau-bench/`
+- 模型路径：`/user/zhujiatong/models/Qwen3-8B`（base）
+- LoRA 路径：`/user/zhujiatong/outputs_pd/sft_bon/final/`、`/user/zhujiatong/outputs_pd/sft_pd/final/`
+- vLLM conda 环境：`vllm-env`（与训练环境分开）
+- GPU：2× H100 80GB（当前 vLLM 只用单卡）
+
+---
+
 ### Session 6 更新（2026-03-04）— E2/E3 SFT 训练完成，评估脚本修复
 
 #### 1. SFT 训练结果（服务器 A100，1 epoch，LoRA r=8，alpha=16，dropout=0.1，q_proj+v_proj）
@@ -63,27 +134,10 @@ PD pass@1：retail 55.4%，airline 62.7%（均高于同 domain BoN pass@1）
 
 `generate_baseline.py` 新增 `agent_model_args` 参数支持上述 per-call override。
 
-#### 3. 评估策略：本地 Mac 通过 SSH 隧道
+#### 3. 评估策略：本地 Mac 通过 VS Code 端口转发
 
-服务器无外网，DashScope API 无法从服务器调用。解决方案：
-
-```bash
-# 本地 Mac：建 SSH 隧道，把服务器 8001 端口转发到本地
-ssh -L 8001:localhost:8001 root@<server_ip> -p <port>
-
-# 服务器：启动 vLLM（无需外网，只监听本机端口）
-vllm serve /root/autodl-tmp/outputs/sft_bon/final \
-    --served-model-name finetuned --port 8001 \
-    --trust-remote-code --dtype bfloat16
-
-# 本地 Mac：跑评估（agent → SSH隧道→vLLM，user → DashScope直连）
-python -m src.evaluation.eval_on_tau_bench \
-    --domain retail airline --split test \
-    --agent-model finetuned \
-    --vllm-url http://localhost:8001/v1 \
-    --user-model openai/qwen-plus \
-    --num-trials 3 --output-dir outputs/results/sft_bon
-```
+服务器无外网，DashScope API 无法从服务器调用（且 Teleport SSH 不支持 `-N -L` 直连隧道）。
+确立的方案：VS Code 连服务器 → PORTS 面板转发 8001 → 本地 Mac 跑评估。详见 Session 7。
 
 ### Session 5 更新（2026-03-04）— Phase B 训练策略确定
 
@@ -412,5 +466,6 @@ pd-tau-bench/
 ├── PROGRESS.md                    # 本文件
 └── scripts/
     ├── step1_setup.sh
-    └── step2_generate.sh
+    ├── step2_generate.sh
+    └── start_vllm.sh              # ← 新增：服务器启动 vLLM（bon/pd 参数）
 ```
