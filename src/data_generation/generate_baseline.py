@@ -45,6 +45,7 @@ def run_baseline_episode(
     temperature: float = 0.0,
     max_steps: int = 30,
     agent_model_args: Optional[dict] = None,
+    user_model_args: Optional[dict] = None,
 ) -> dict:
     """Run a single episode with standard greedy decoding."""
     episode_start = time.time()
@@ -54,13 +55,16 @@ def run_baseline_episode(
     else:
         agent_model_args = {"temperature": temperature, **agent_model_args}
 
+    if user_model_args is None:
+        user_model_args = {"temperature": 0.0}
+
     orch = create_orchestrator(
         domain=domain,
         task=task,
         agent_model=agent_model,
         user_model=user_model,
         agent_model_args=agent_model_args,
-        user_model_args={"temperature": 0.0},
+        user_model_args=user_model_args,
         max_steps=max_steps,
     )
     orch.initialize()

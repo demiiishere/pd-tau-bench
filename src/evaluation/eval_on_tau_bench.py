@@ -1,16 +1,15 @@
 """
-Evaluate a fine-tuned model on tau-bench test split (Phase B — run on GPU machine).
+Evaluate a fine-tuned model on tau-bench test split.
 
-The fine-tuned model must be served via vLLM:
-    vllm serve /root/autodl-tmp/outputs/sft_pd/final \
-        --served-model-name finetuned \
-        --port 8001 --trust-remote-code --dtype bfloat16
+Setup: SSH tunnel to the GPU server (in a separate terminal, leave it running):
+    ssh -N -L 8001:localhost:8001 <ssh-host>
+    # Verify: curl http://localhost:8001/v1/models
 
 Run:
-    python -m src.evaluation.eval_on_tau_bench \
+    python3.11 -m src.evaluation.eval_on_tau_bench \
         --domain retail \
         --split test \
-        --agent-model finetuned \
+        --agent-model openai/finetuned \
         --vllm-url http://localhost:8001/v1 \
         --user-model openai/qwen-plus \
         --num-trials 3 \
@@ -26,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+import litellm
 from loguru import logger
 
 
@@ -40,21 +40,32 @@ def evaluate_model(
     max_concurrency: int,
 ):
     from src.predictive_decoding.tau_bench_adapter import (
-        configure_litellm_for_dashscope,
         get_tasks,
         load_task_split,
     )
     from src.data_generation.generate_baseline import run_baseline_episode
 
-    # Configure DashScope for the user simulator (qwen-plus).
-    # The agent model is routed to vLLM via per-call api_base/api_key in agent_model_args,
-    # which litellm honours as call-level overrides without touching OPENAI_API_BASE.
-    configure_litellm_for_dashscope()
+    # Routing strategy (inverse pattern — vLLM is the global default):
+    #   Agent model  → vLLM via OPENAI_API_BASE (global default)
+    #   User model   → DashScope via explicit per-call api_base/api_key in user_model_args
+    #
+    # This avoids relying on per-call api_base overriding a conflicting global env var.
+    dashscope_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not dashscope_key:
+        raise EnvironmentError("DASHSCOPE_API_KEY not set")
 
-    # agent_model_args: route the fine-tuned model to the local vLLM server
-    agent_model_args = {
-        "api_base": vllm_url,
-        "api_key": "fake",      # vLLM does not validate the key
+    os.environ["OPENAI_API_BASE"] = vllm_url
+    os.environ["OPENAI_API_KEY"] = "fake"   # vLLM does not validate the key
+    litellm.drop_params = True
+
+    # agent_model_args: temperature only; routing uses the global OPENAI_API_BASE above
+    agent_model_args = {}
+
+    # user_model_args: explicit DashScope credentials to override the global vLLM base
+    user_model_args = {
+        "temperature": 0.0,
+        "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_key": dashscope_key,
     }
 
     # Load only the test split tasks
@@ -84,6 +95,7 @@ def evaluate_model(
             user_model=user_model,
             temperature=0.0,
             agent_model_args=agent_model_args,
+            user_model_args=user_model_args,
         )
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
