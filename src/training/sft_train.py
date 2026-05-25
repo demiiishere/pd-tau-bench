@@ -31,6 +31,7 @@ def train_sft(
     eval_fraction: float = 0.05,
     general_data_path: str | None = None,
     max_steps: int = -1,
+    seed: int = 42,
 ):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
@@ -125,6 +126,8 @@ def train_sft(
     # smaller effective batch (4 vs 8) for more gradient updates.
     training_args = SFTConfig(
         output_dir=output_dir,
+        seed=seed,
+        data_seed=seed,
         num_train_epochs=1,
         max_steps=max_steps,  # -1 = no limit; set >0 for quick smoke tests
         per_device_train_batch_size=1,
@@ -188,9 +191,11 @@ def main():
         default=-1,
         help="Max training steps (-1 = full epoch). Use 2-5 for a quick smoke test.",
     )
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Training seed (controls data shuffling & LoRA init).")
     args = parser.parse_args()
     train_sft(args.model, args.dataset, args.output, args.source, args.eval_fraction,
-              args.general_data, args.max_steps)
+              args.general_data, args.max_steps, args.seed)
 
 
 if __name__ == "__main__":

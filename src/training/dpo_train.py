@@ -29,6 +29,7 @@ def train_dpo(
     min_score_gap: float = 0.05,
     eval_fraction: float = 0.0,
     max_steps: int = -1,
+    seed: int = 42,
 ):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import DPOConfig, DPOTrainer
@@ -98,6 +99,8 @@ def train_dpo(
     # too far from SFT checkpoint with limited data).
     training_args = DPOConfig(
         output_dir=output_dir,
+        seed=seed,
+        data_seed=seed,
         num_train_epochs=1,
         max_steps=max_steps,  # -1 = no limit; set >0 for quick smoke tests
         per_device_train_batch_size=1,
@@ -154,6 +157,8 @@ def main():
         default=-1,
         help="Max training steps (-1 = full epoch). Use 2-5 for a quick smoke test.",
     )
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Training seed (controls data shuffling & LoRA init).")
     args = parser.parse_args()
     train_dpo(
         args.sft_model,
@@ -162,6 +167,7 @@ def main():
         args.min_score_gap,
         args.eval_fraction,
         args.max_steps,
+        args.seed,
     )
 
 

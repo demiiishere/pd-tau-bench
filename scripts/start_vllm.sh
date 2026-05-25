@@ -6,8 +6,7 @@
 #   pd           → serve sft_pd/final          with LoRA, thinking OFF
 #   dpo          → serve dpo_pd/final          with LoRA, thinking OFF
 #   pd_onpolicy  → serve sft_pd_onpolicy/final  with LoRA, thinking ON  (on-policy evaluation)
-#   bon_onpolicy   → serve sft_bon3_onpolicy/final  with LoRA, thinking ON  (BoN ablation evaluation)
-#   mixed_onpolicy → serve sft_mixed_onpolicy/final with LoRA, thinking ON  (PD+BoN mixed evaluation)
+#   bon_onpolicy → serve sft_bon3_onpolicy/final with LoRA, thinking ON  (BoN ablation evaluation)
 
 set -e
 
@@ -31,11 +30,6 @@ elif [ "$VARIANT" = "pd_onpolicy" ]; then
     vllm serve "${BASE_MODEL}" --enable-lora --lora-modules "finetuned=${LORA_PATH}" --port "${PORT}" --trust-remote-code --dtype bfloat16 --max-model-len 32768 --enable-auto-tool-choice --tool-call-parser hermes > "${LOG_FILE}" 2>&1 &
 elif [ "$VARIANT" = "bon_onpolicy" ]; then
     LORA_PATH="/user/zhujiatong/outputs_pd/sft_bon3_onpolicy/final"
-    echo "Starting vLLM: model=${VARIANT}, lora=${LORA_PATH}, thinking ON, port=${PORT}"
-    echo "Log: ${LOG_FILE}"
-    vllm serve "${BASE_MODEL}" --enable-lora --lora-modules "finetuned=${LORA_PATH}" --port "${PORT}" --trust-remote-code --dtype bfloat16 --max-model-len 32768 --enable-auto-tool-choice --tool-call-parser hermes > "${LOG_FILE}" 2>&1 &
-elif [ "$VARIANT" = "mixed_onpolicy" ]; then
-    LORA_PATH="/user/zhujiatong/outputs_pd/sft_mixed_onpolicy/final"
     echo "Starting vLLM: model=${VARIANT}, lora=${LORA_PATH}, thinking ON, port=${PORT}"
     echo "Log: ${LOG_FILE}"
     vllm serve "${BASE_MODEL}" --enable-lora --lora-modules "finetuned=${LORA_PATH}" --port "${PORT}" --trust-remote-code --dtype bfloat16 --max-model-len 32768 --enable-auto-tool-choice --tool-call-parser hermes > "${LOG_FILE}" 2>&1 &
