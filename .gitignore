@@ -12,14 +12,24 @@ build/
 .venv
 env/
 
-# Data (raw trajectories can be large; keep dataset stats but not full data)
+# Data (raw trajectories are large; gitignore all data subdirs)
 data/raw_trajectories/
+data/raw_trajectories_*/
 data/sft_dataset/
+data/sft_dataset_*/
 data/dpo_dataset/
+data/dpo_dataset_*/
+data/results/
 
-# Model outputs
+# Model outputs and checkpoints
 outputs/models/
 outputs/results/
+outputs_pd/
+
+# Misc local files
+testapi.py
+中期报告.txt
+turn_pd_complete_research_plan.md
 
 # Jupyter
 .ipynb_checkpoints/

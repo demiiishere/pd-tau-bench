@@ -2,8 +2,38 @@
 
 ## TL;DR
 
-**Phase B 进行中：E2 (BoN) 和 E3 (PD) SFT 训练已完成，准备跑评估。**
-评估策略：服务器跑 vLLM（无需外网），本地 Mac 通过 SSH 隧道连接 vLLM + 直接调 DashScope API。
+**Phase B：E0/E2/E3/E4 评估完成（thinking ON 为正式结果）。**
+评估策略：服务器跑 vLLM（无需外网），本地 Mac 通过 VS Code PORTS 端口转发连接 vLLM + 直接调 DashScope API。
+
+### 当前评估结果（test split，3 trials）
+
+#### Thinking ON（推荐，性能更好）
+
+| 实验 | retail pass@1 | retail pass@3 | retail oracle | airline pass@1 | airline pass@3 | airline oracle |
+|------|--------------|--------------|--------------|---------------|---------------|---------------|
+| E0 zero-shot | 0.3235 | 0.1765 | 0.5000 | 0.1778 | 0.0 | 0.4000 |
+| E2 BoN SFT | 0.3137 | 0.0588 | 0.5588 | 0.0889 | 0.0 | 0.2000 |
+| E3 PD SFT | 0.3137 | 0.1471 | 0.4706 | 0.1111 | 0.0 | 0.2000 |
+
+#### Thinking OFF（`enable_thinking=False` 训练 + 评估）
+
+| 实验 | retail pass@1 | retail pass@3 | retail oracle | airline pass@1 | airline pass@3 | airline oracle |
+|------|--------------|--------------|--------------|---------------|---------------|---------------|
+| E0 zero-shot | 0.3137 | 0.0882 | 0.5000 | 0.0889 | 0.0 | 0.1333 |
+| E2 BoN SFT | 0.2353 | 0.0882 | 0.3824 | 0.0889 | 0.0 | 0.2667 |
+| E3 PD SFT | 0.2451 | 0.1176 | 0.4118 | 0.0667 | 0.0 | 0.2000 |
+| E4 DPO (on E3) | 0.2549 | 0.0882 | 0.4412 | 0.0444 | 0.0 | 0.1333 |
+
+**注意**：E4 基于 thinking OFF 的 SFT 模型训练，评估也在 thinking OFF 下进行，应与同列（thinking OFF）比较。
+**结论：thinking ON 全面优于 thinking OFF，应使用 thinking ON 作为正式结果。**
+
+**观察**：
+- **Zero-shot 优于所有 SFT（thinking ON 列）**：Qwen3-8B 本身 function calling 能力强，小数据 SFT（197-295 条）不足以超越 zero-shot，反而轻微损坏通用推理能力（catastrophic forgetting 轻量版）
+- **E3 retail pass@3（0.1471）> E2（0.0588）**：PD 轨迹质量更高，一致性更好，但仍低于 zero-shot（0.1765）
+- **Airline 普遍很差**：zero-shot oracle 也只有 0.4，airline 本身对 Qwen3-8B 就难；SFT 数据量更少（64 条），提升空间不足
+- **E4 DPO 基本没有改善**（与 E3 thinking OFF 比：retail +1pp，airline -2pp）：根本原因是 thinking 不匹配——SFT/DPO 训练时 `enable_thinking=False`，但最优性能需要 thinking ON；小数据 DPO（313 对）在已经退化的 SFT checkpoint 上很难有正向提升
+- **核心问题（thinking mismatch）**：数据生成用的是 thinking ON 的 Qwen-Plus，SFT 训练时却用 `enable_thinking=False` → 模型学到了一个没有 thinking 步骤的行为克隆，inference 时如果开 thinking 则格式不匹配
+- **下一步建议**：用 thinking ON 重新跑 E2/E3 SFT 训练（训练时不加 `enable_thinking=False`），并在 eval 时也用 thinking ON（去掉 `extra_body` 中的 disable），这样才能充分利用 Qwen3-8B 的推理能力
 
 | | retail | airline | 合计 |
 |--|--|--|--|
@@ -49,10 +79,11 @@ PD pass@1：retail 55.4%，airline 62.7%（均高于同 domain BoN pass@1）
 ```bash
 # 在 VS Code 里打开 devspace-zhujiatong-pad-alter-193739，
 # 然后在 VS Code 终端里执行：
+source /user/zhujiatong/miniconda3/bin/activate   # 每次新终端必须先执行
 cd /user/zhujiatong/pd-tau-bench
 git pull
 conda activate vllm-env
-bash scripts/start_vllm.sh bon   # 或 pd
+bash scripts/start_vllm.sh bon   # bon | pd | dpo
 # 等待约 30s，看到 "Application startup complete" 即可
 curl http://localhost:8001/v1/models   # 验证：应返回含 "finetuned" 的 JSON
 ```
@@ -74,6 +105,18 @@ curl http://localhost:8001/v1/models   # 若端口映射到其他号，换成对
 conda activate pd-tau-bench
 cd /Users/zhujiatong/pd-tau-bench
 
+# E0: 零样本 baseline（vLLM 直接 serve base model，不加 LoRA）
+# 服务器启动时用：vllm serve /user/zhujiatong/models/Qwen3-8B --port 8001 ...（不带 --enable-lora）
+python3.11 -m src.evaluation.eval_on_tau_bench \
+    --domain retail \
+    --split test \
+    --agent-model "openai//user/zhujiatong/models/Qwen3-8B" \
+    --vllm-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 \
+    --output-dir outputs/results/zero_shot
+
+# E2: BoN SFT（服务器先跑 bash scripts/start_vllm.sh bon）
 python3.11 -m src.evaluation.eval_on_tau_bench \
     --domain retail \
     --split test \
@@ -83,6 +126,26 @@ python3.11 -m src.evaluation.eval_on_tau_bench \
     --num-trials 3 \
     --output-dir outputs/results/sft_bon
 # airline 同理，换 --domain airline --output-dir outputs/results/sft_bon_airline
+
+# E3: PD SFT（服务器先跑 bash scripts/start_vllm.sh pd）
+python3.11 -m src.evaluation.eval_on_tau_bench \
+    --domain retail \
+    --split test \
+    --agent-model openai/finetuned \
+    --vllm-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 \
+    --output-dir outputs/results/sft_pd
+
+# E4: DPO（服务器先跑 bash scripts/start_vllm.sh dpo）
+python3.11 -m src.evaluation.eval_on_tau_bench \
+    --domain retail airline \
+    --split test \
+    --agent-model openai/finetuned \
+    --vllm-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 \
+    --output-dir outputs/results/sft_pd_dpo
 ```
 
 #### 本次调试记录的问题与修复
@@ -106,7 +169,9 @@ python3.11 -m src.evaluation.eval_on_tau_bench \
 - 项目路径：`/user/zhujiatong/pd-tau-bench/`
 - 模型路径：`/user/zhujiatong/models/Qwen3-8B`（base）
 - LoRA 路径：`/user/zhujiatong/outputs_pd/sft_bon/final/`、`/user/zhujiatong/outputs_pd/sft_pd/final/`
-- vLLM conda 环境：`vllm-env`（与训练环境分开）
+- 训练 conda 环境：`pd-qwen3-8b`；推理 conda 环境：`vllm-env`
+- 每次新终端需先执行：`source /user/zhujiatong/miniconda3/bin/activate`
+- **无公网**：仅可用 HF mirror（`https://hf-mirror.com`）、清华/USTC 镜像源
 - GPU：2× H100 80GB（当前 vLLM 只用单卡）
 
 ---
@@ -413,17 +478,168 @@ PD 对 3 个候选做了 2 步 foresight：
 - [ ] 跑预实验（先跑 E2 debug 训练流程，确认无 OOM / loss 正常）
 - [ ] 跑正式实验（按优先级，**所有 SFT 用相同 LoRA 和超参**）：
 
-  | 实验 | 说明 | 优先级 |
-  |------|------|------|
-  | E0 | zero-shot（直接评估，无训练）| ★★★ |
-  | E2 | SFT on BoN 295 条 | ★★★ |
-  | E3 | SFT on PD 197 条 | ★★★ |
-  | E1 | SFT on standard 61 条 | ★★ |
-  | E2+ | E2 → DPO on BoN episode-level pairs | ★★ |
-  | E4 | E3 → DPO on PD turn-level pairs | ★★ |
+  | 实验 | 说明 | 优先级 | 状态 |
+  |------|------|------|------|
+  | E0 | zero-shot（直接评估，无训练）| ★★★ | retail ✅ / airline ✅ |
+  | E2 | SFT on BoN 295 条 | ★★★ | retail ✅ / airline ✅ |
+  | E3 | SFT on PD 197 条 | ★★★ | retail ✅ / airline ✅ |
+  | E1 | SFT on standard 61 条 | ★★ | ⬜ |
+  | E2+ | E2 → DPO on BoN episode-level pairs | ★★ | ⬜ |
+  | E4 | E3 → DPO on PD turn-level pairs | ★★ | retail ✅ / airline ✅（thinking OFF，效果不佳）|
 
 - [ ] 评估所有模型（retail+airline test split，`eval_on_tau_bench.py`），报告 pass@1
 - [ ] **核心对比**：E2+ vs E4（turn-level vs episode-level DPO），E2 vs E3（PD vs BoN SFT）
+
+### Phase C — On-policy 自蒸馏（当前阶段）
+
+**核心思路**：用 Qwen3-8B 自己生成训练数据（thinking ON），迭代 fine-tune 自己，消除 distribution mismatch。不与 BoN 比较，专注于自蒸馏是否能让模型迭代提升。
+
+#### 自蒸馏迭代框架
+
+```
+Base Qwen3-8B
+    ↓ (PD生成高质量轨迹, thinking ON)
+Round 0 数据 → SFT → Qwen3-8B-v1
+    ↓ (v1用PD生成更好的轨迹)
+Round 1 数据 → SFT → Qwen3-8B-v2  ...
+```
+
+**评估重点**：test split pass@1 是否随轮次上升（与 base 模型比较，user simulator 也用 Qwen3-8B）。
+
+#### Round 0 数据生成结果（train split，115 tasks）
+
+**PD（K=5, H=2）**
+
+| 指标 | 值 |
+|-----|---|
+| Oracle（任意1次成功） | 55/115 = **47.8%** |
+| Avg pass@1 | **32.2%** |
+| 成功轨迹数（SFT数据）| **111条** |
+
+**BoN N=3 消融（同样3次试验，无value function）**
+
+| 指标 | 值 |
+|-----|---|
+| Oracle（任意1次成功） | 48/115 = **41.7%** |
+| Avg pass@1 | **28.8%** |
+| 成功轨迹数（SFT数据）| ~100条 |
+
+PD oracle 比 BoN 高 +6.1pp，说明 value function 确有引导作用；PD pass@1 高 +3.4pp。
+
+#### Round 0 SFT 训练
+
+训练 5 epochs，111条成功轨迹，thinking ON 数据，约 200s。
+
+```
+train_loss: 1.141 → 收敛
+mean_token_accuracy: 0.7247
+```
+
+#### Round 0 评估结果（test split，3 trials，user=Qwen3-8B）
+
+| 模型 | retail pass@1 | retail pass@3 | retail oracle | airline pass@1 | airline pass@3 | airline oracle |
+|-----|:---:|:---:|:---:|:---:|:---:|:---:|
+| Base Qwen3-8B | 0.2157 | 0.1176 | 0.3529 | **0.1556** | 0.0667 | **0.2667** |
+| PD SFT（111条） | **0.2647** | **0.1176** | 0.4412 | 0.1333 | 0.0667 | 0.2000 |
+| BoN SFT（~100条） | 0.2353 | 0.0588 | **0.4706** | **0.1778** | 0.0667 | **0.2667** |
+| Mixed SFT（PD+BoN） | 0.1961 | 0.0882 | 0.3529 | 0.0667 | 0.0667 | 0.0667 |
+
+**注意**：此处 user simulator 是 Qwen3-8B，与 Phase B 评估（user=Qwen-Plus）不可直接比较。
+
+#### 消融分析结论
+
+**数据生成 vs 评估结果的关联：**
+
+| domain | PD oracle | BoN oracle | 差值 | PD SFT | BoN SFT | 优胜者 |
+|--------|-----------|------------|------|--------|---------|--------|
+| retail | 更高 | 较低 | +6.2pp | **0.2647** | 0.2353 | **PD** |
+| airline | 较高 | 相近 | +5.7pp | 0.1333 | **0.1778** | **BoN** |
+
+**解读**：
+- retail：PD oracle 明显更高 → value function 有效引导 → PD 轨迹质量高 → SFT 效果好
+- airline：两者 oracle 相近，但 BoN 轨迹更干净（无 value function 噪声）→ BoN SFT 更好
+- **结论**：PD 数据质量优势体现在 oracle 率差距大时；BoN 轨迹更一致干净，适合 value function 噪声较大的场景
+
+#### 混合训练结果（❌ 失败）
+
+将 PD(111条) + BoN(~100条) 数据合并后训练，结果比单独训练更差：
+- retail pass@1: 0.1961（低于 base 0.2157）
+- airline pass@1: 0.0667（灾难性遗忘，oracle 也只有 0.0667）
+
+**原因**：PD 和 BoN 轨迹风格冲突（PD = step-level 最优选，BoN = episode 整体成功但步骤未必最优），混合后训练信号矛盾。且 PD 数据以 retail 为主，混合后模型 airline 分布被严重稀释。
+
+**结论：简单合并无效，放弃混合策略。**
+
+#### 完整执行流程（全部在服务器上，无需联网）
+
+**环境说明**
+- 终端 A：`vllm-env`，负责 vLLM serving
+- 终端 B：`pd-qwen3-8b`，负责数据生成和训练
+- 每次新终端先执行：`source /user/zhujiatong/miniconda3/bin/activate`
+
+**Step 1：启动 vLLM**
+
+```bash
+# 数据生成用 base 模型（thinking ON）
+bash scripts/start_vllm.sh base
+
+# 评估 fine-tuned 模型（thinking ON）
+bash scripts/start_vllm.sh pd_onpolicy
+
+# 验证（no_proxy 绕过服务器代理）
+no_proxy=localhost curl http://localhost:8001/v1/models
+# 两个 variant 都已设置 --served-model-name finetuned，返回 "finetuned"
+```
+
+**Step 2：PD 数据生成**
+
+```bash
+python -m src.data_generation.generate_trajectories_onpolicy --domain retail airline --K 5 --H 2 --num-trials 3 --max-concurrency 3 --output-dir data/raw_trajectories_onpolicy
+```
+
+支持断点续传（已有 `task_{id}_trial_{n}_pd.json` 文件自动跳过）。
+
+**Step 3：构建数据集**
+
+```bash
+python -m src.data_generation.build_dataset --raw-dir data/raw_trajectories_onpolicy --sft-output data/sft_dataset_onpolicy/train.jsonl --dpo-output data/dpo_dataset_onpolicy/train.jsonl
+```
+
+`build_dataset.py` 支持 `--source pd|baseline|bon`（默认 pd）。
+
+**Step 4：SFT 训练（先关掉 vLLM）**
+
+```bash
+python -m src.training.sft_train_onpolicy --model /user/zhujiatong/models/Qwen3-8B --dataset data/sft_dataset_onpolicy/train.jsonl --output /user/zhujiatong/outputs_pd/sft_pd_onpolicy --eval-fraction 0
+```
+
+注：`sft_train_onpolicy.py` 已设 5 epochs，max_length=16384（容纳 thinking tokens）。
+
+**Step 5：评估（在服务器上，无需本地 Mac）**
+
+```bash
+# 服务器启动 fine-tuned 模型
+bash scripts/start_vllm.sh pd_onpolicy
+
+# 评估（--local 表示 user model 也用本地 vLLM，--enable-thinking 开 thinking）
+python -m src.evaluation.eval_on_tau_bench --domain retail airline --split test --agent-model openai/finetuned --vllm-url http://localhost:8001/v1 --user-model openai/finetuned --local --enable-thinking --num-trials 3 --output-dir outputs/results/sft_pd_onpolicy_round0 --max-concurrency 5
+
+# Base 模型对照（换 base variant，去掉 --enable-thinking 可选）
+bash scripts/start_vllm.sh base
+python -m src.evaluation.eval_on_tau_bench --domain retail airline --split test --agent-model openai/finetuned --vllm-url http://localhost:8001/v1 --user-model openai/finetuned --local --enable-thinking --num-trials 3 --output-dir outputs/results/base_qwen3_local --max-concurrency 5
+```
+
+#### 实验进度
+
+| 实验 | 说明 | 状态 |
+|------|------|------|
+| Round 0 PD 数据生成 | 115 tasks, 3 trials, K=5 H=2 | ✅ 完成（111条成功） |
+| Round 0 BoN N=3 消融 | 115 tasks, N=3 | ✅ 完成（~100条成功） |
+| Round 0 PD SFT | 111条，5 epochs | ✅ 完成 |
+| Round 0 BoN SFT | ~100条，5 epochs | ✅ 完成 |
+| Round 0 eval（PD vs BoN vs Base） | test split，user=Qwen3-8B | ✅ 完成（见上表） |
+| 混合训练（PD+BoN） | ~211条混合数据 | ✅ 完成（airline 崩溃，策略放弃） |
+| Round 1 自蒸馏 | 用 sft_pd_onpolicy 生成 Round 1 数据 | ⬜ 待做 |
 
 ### 潜在优化（供参考，见 potential_optimization.md）
 
@@ -467,5 +683,5 @@ pd-tau-bench/
 └── scripts/
     ├── step1_setup.sh
     ├── step2_generate.sh
-    └── start_vllm.sh              # ← 新增：服务器启动 vLLM（bon/pd 参数）
+    └── start_vllm.sh              # ← 新增：服务器启动 vLLM（bon/pd/dpo 参数）
 ```

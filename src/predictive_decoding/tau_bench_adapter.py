@@ -23,8 +23,11 @@ def get_environment_constructor(domain: str):
     elif domain == "airline":
         from tau2.domains.airline.environment import get_environment
         return get_environment
+    elif domain == "telecom":
+        from tau2.domains.telecom.environment import get_environment
+        return get_environment
     else:
-        raise ValueError(f"Unsupported domain: {domain}. Choose from: retail, airline")
+        raise ValueError(f"Unsupported domain: {domain}. Choose from: retail, airline, telecom")
 
 
 def get_tasks(domain: str, task_split: str = "base") -> list[Task]:
@@ -33,6 +36,8 @@ def get_tasks(domain: str, task_split: str = "base") -> list[Task]:
         from tau2.domains.retail.environment import get_tasks as _get_tasks
     elif domain == "airline":
         from tau2.domains.airline.environment import get_tasks as _get_tasks
+    elif domain == "telecom":
+        from tau2.domains.telecom.environment import get_tasks as _get_tasks
     else:
         raise ValueError(f"Unsupported domain: {domain}")
     return _get_tasks(task_split_name=task_split)
@@ -47,7 +52,7 @@ def load_task_split(
     Load task IDs for a given domain and split ('train' or 'test').
 
     Args:
-        domain: 'retail' or 'airline'
+        domain: 'retail', 'airline', or 'telecom'
         split: 'train', 'test', or 'all'
         splits_path: path to the task_splits.json file
 
@@ -205,8 +210,16 @@ def configure_litellm_for_dashscope(api_key: Optional[str] = None) -> None:
     """
     Configure litellm to use the DashScope API.
     Call this once before creating any orchestrators.
+    If OPENAI_API_BASE is already set in the environment, skip DashScope
+    configuration and use the existing endpoint (e.g. a local inference server).
     """
     import litellm
+
+    litellm.drop_params = True
+
+    # If caller already set a custom base URL, honour it and skip DashScope setup.
+    if os.environ.get("OPENAI_API_BASE"):
+        return
 
     key = api_key or os.environ.get("DASHSCOPE_API_KEY")
     if not key:
@@ -216,4 +229,3 @@ def configure_litellm_for_dashscope(api_key: Optional[str] = None) -> None:
     # litellm picks up OPENAI_API_KEY and OPENAI_API_BASE for openai/* models
     os.environ["OPENAI_API_KEY"] = key
     os.environ["OPENAI_API_BASE"] = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    litellm.drop_params = True

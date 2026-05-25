@@ -29,6 +29,50 @@ import litellm
 from loguru import logger
 
 
+def _apply_sliding_window_patch():
+    """Monkey-patch tau2.utils.llm_utils.completion to handle context overflow.
+
+    tau2 does `from litellm import completion` at import time, so we must replace
+    the name in that module's namespace (not litellm.completion globally).
+    When the model raises a context-length error, we drop the two oldest
+    non-system messages and retry until the context fits or nothing left to drop.
+    """
+    import tau2.utils.llm_utils as llm_utils
+    from litellm import completion as _orig
+
+    _CTX_KEYWORDS = (
+        "context_length_exceeded",
+        "maximum context length",
+        "input too long",
+        "maximum input",
+        "token limit",
+        "40960",
+    )
+
+    def _completion_sliding_window(model, messages, **kwargs):
+        current = list(messages)
+        while True:
+            try:
+                return _orig(model=model, messages=current, **kwargs)
+            except Exception as exc:
+                err = str(exc).lower()
+                if not any(k in err for k in _CTX_KEYWORDS):
+                    raise
+                sys_msgs = [m for m in current if m.get("role") == "system"]
+                conv_msgs = [m for m in current if m.get("role") != "system"]
+                if len(conv_msgs) <= 2:
+                    raise  # nothing left to drop
+                dropped = conv_msgs[:2]
+                logger.warning(
+                    f"Context overflow — dropping oldest 2 messages "
+                    f"({dropped[0].get('role')}, {conv_msgs[1].get('role')}). "
+                    f"Remaining conv turns: {(len(conv_msgs) - 2) // 2}"
+                )
+                current = sys_msgs + conv_msgs[2:]
+
+    llm_utils.completion = _completion_sliding_window
+
+
 def evaluate_model(
     domain: str,
     agent_model: str,
@@ -38,6 +82,8 @@ def evaluate_model(
     split: str,
     output_dir: Path,
     max_concurrency: int,
+    local: bool = False,
+    enable_thinking: bool = False,
 ):
     from src.predictive_decoding.tau_bench_adapter import (
         get_tasks,
@@ -45,28 +91,40 @@ def evaluate_model(
     )
     from src.data_generation.generate_baseline import run_baseline_episode
 
-    # Routing strategy (inverse pattern — vLLM is the global default):
-    #   Agent model  → vLLM via OPENAI_API_BASE (global default)
-    #   User model   → DashScope via explicit per-call api_base/api_key in user_model_args
-    #
-    # This avoids relying on per-call api_base overriding a conflicting global env var.
-    dashscope_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if not dashscope_key:
-        raise EnvironmentError("DASHSCOPE_API_KEY not set")
+    _apply_sliding_window_patch()
 
-    os.environ["OPENAI_API_BASE"] = vllm_url
-    os.environ["OPENAI_API_KEY"] = "fake"   # vLLM does not validate the key
     litellm.drop_params = True
 
-    # agent_model_args: temperature only; routing uses the global OPENAI_API_BASE above
-    agent_model_args = {}
+    # Bypass proxy for localhost (server has http_proxy set)
+    for var in ("no_proxy", "NO_PROXY"):
+        existing = os.environ.get(var, "")
+        if "localhost" not in existing:
+            os.environ[var] = f"localhost,127.0.0.1,{existing}".strip(",")
 
-    # user_model_args: explicit DashScope credentials to override the global vLLM base
-    user_model_args = {
-        "temperature": 0.0,
-        "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "api_key": dashscope_key,
+    # agent_model_args: local vLLM
+    agent_model_args = {
+        "api_base": vllm_url,
+        "api_key": "fake",
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": enable_thinking}},
     }
+
+    if local:
+        # Both agent and user use local vLLM — no internet required
+        user_model_args = {
+            "temperature": 0.0,
+            "api_base": vllm_url,
+            "api_key": "fake",
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        }
+    else:
+        dashscope_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if not dashscope_key:
+            raise EnvironmentError("DASHSCOPE_API_KEY not set (or use --local)")
+        user_model_args = {
+            "temperature": 0.0,
+            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "api_key": dashscope_key,
+        }
 
     # Load only the test split tasks
     all_tasks = get_tasks(domain, task_split="base")
@@ -111,6 +169,11 @@ def evaluate_model(
                 logger.info(f"Task {task.id} trial {trial}: reward={result['final_reward']}")
             except Exception as e:
                 logger.error(f"Task {task.id} trial {trial} FAILED: {e}")
+                failed = {"task_id": task.id, "final_reward": 0.0, "error": str(e)}
+                out_path = output_dir / f"task_{task.id}_trial_{trial}.json"
+                with open(out_path, "w") as f:
+                    json.dump(failed, f, indent=2)
+                results.append(failed)
 
     # ── Aggregate results ─────────────────────────────────────────────────────
     rewards_by_task: dict[str, list[float]] = {}
@@ -168,6 +231,10 @@ def main():
     parser.add_argument("--num-trials", type=int, default=3)
     parser.add_argument("--output-dir", default="outputs/results/eval")
     parser.add_argument("--max-concurrency", type=int, default=5)
+    parser.add_argument("--local", action="store_true",
+                        help="Use local vLLM for user model too (no internet required).")
+    parser.add_argument("--enable-thinking", action="store_true",
+                        help="Enable thinking for agent model (use for on-policy models).")
     args = parser.parse_args()
 
     for domain in args.domain:
@@ -180,6 +247,8 @@ def main():
             split=args.split,
             output_dir=Path(args.output_dir) / domain,
             max_concurrency=args.max_concurrency,
+            local=args.local,
+            enable_thinking=args.enable_thinking,
         )
 
 

@@ -20,10 +20,16 @@ Run:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+
+def _safe_id(task_id: str) -> str:
+    """Sanitize task_id for use in filenames (telecom IDs contain |, [], :)."""
+    return re.sub(r'[^\w\-.]', '_', str(task_id))
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -52,15 +58,17 @@ def run_one_trial(
     max_steps: int,
     output_dir: Path,
     also_baseline: bool = True,
+    enable_thinking: bool = False,
 ) -> dict:
     """Run one PD trial (and optionally a baseline) for a single task."""
+    agent_extra = {"extra_body": {"enable_thinking": True}} if enable_thinking else {}
     # PD trajectory
     orch = create_orchestrator(
         domain=domain,
         task=task,
         agent_model=agent_model,
         user_model=user_model,
-        agent_model_args={"temperature": 0.0},
+        agent_model_args={"temperature": 0.0, **agent_extra},
         user_model_args={"temperature": 0.0},
         max_steps=max_steps,
     )
@@ -73,7 +81,7 @@ def run_one_trial(
         foresight_temperature=foresight_temperature,
         max_steps=max_steps,
     )
-    pd_path = output_dir / f"task_{task.id}_trial_{trial}_pd.json"
+    pd_path = output_dir / f"task_{_safe_id(task.id)}_trial_{trial}_pd.json"
     with open(pd_path, "w", encoding="utf-8") as f:
         json.dump(pd_result, f, indent=2, ensure_ascii=False)
 
@@ -92,7 +100,7 @@ def run_one_trial(
 
     # Baseline trajectory (trial 0 only to save API cost)
     if also_baseline and trial == 0:
-        baseline_path = output_dir / f"task_{task.id}_baseline.json"
+        baseline_path = output_dir / f"task_{_safe_id(task.id)}_baseline.json"
         if not baseline_path.exists():
             bl_result = run_baseline_episode(
                 domain=domain,
@@ -101,6 +109,7 @@ def run_one_trial(
                 user_model=user_model,
                 temperature=0.0,
                 max_steps=max_steps,
+                agent_model_args=agent_extra if agent_extra else None,
             )
             with open(baseline_path, "w", encoding="utf-8") as f:
                 json.dump(bl_result, f, indent=2, ensure_ascii=False)
@@ -130,6 +139,8 @@ def main():
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--max-concurrency", type=int, default=5)
     parser.add_argument("--no-baseline", action="store_true")
+    parser.add_argument("--enable-thinking", action="store_true",
+                        help="Pass enable_thinking=True to the agent model (for Qwen3-thinking-compatible APIs).")
     args = parser.parse_args()
 
     configure_litellm_for_dashscope()
@@ -154,7 +165,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         for task in tasks:
             for trial in range(args.num_trials):
-                pd_path = output_dir / f"task_{task.id}_trial_{trial}_pd.json"
+                pd_path = output_dir / f"task_{_safe_id(task.id)}_trial_{trial}_pd.json"
                 if pd_path.exists():
                     logger.info(f"Skip existing: {pd_path.name}")
                     continue
@@ -185,6 +196,7 @@ def main():
             max_steps=args.max_steps,
             output_dir=output_dir,
             also_baseline=not args.no_baseline,
+            enable_thinking=args.enable_thinking,
         )
 
     with ThreadPoolExecutor(max_workers=args.max_concurrency) as executor:

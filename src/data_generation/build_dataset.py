@@ -367,25 +367,24 @@ def main():
     parser.add_argument("--raw-dir", default="data/raw_trajectories",
                         help="Parent directory containing per-domain subdirectories.")
     parser.add_argument("--sft-output", default="data/sft_dataset/train.jsonl")
-    parser.add_argument("--sft-baseline-output", default="data/sft_dataset/train_baseline.jsonl")
-    parser.add_argument("--sft-bon-output", default="data/sft_dataset/train_bon.jsonl")
     parser.add_argument("--dpo-output", default="data/dpo_dataset/train.jsonl")
-    parser.add_argument("--bon-dpo-output", default="data/dpo_dataset/train_bon_episode.jsonl",
-                        help="Episode-level DPO pairs from BoN (for E2+ baseline).")
     parser.add_argument("--min-score-gap", type=float, default=0.1)
     parser.add_argument(
         "--split", default="train", choices=["train", "test", "all"],
         help="Task split to include (default: train)."
     )
+    parser.add_argument(
+        "--source", default="pd", choices=["pd", "baseline", "bon"],
+        help="Source of SFT trajectories: pd (default), baseline, or bon."
+    )
     args = parser.parse_args()
 
     # Output files start fresh (we'll append per-domain below)
-    for out in [args.sft_output, args.sft_baseline_output,
-                args.sft_bon_output, args.dpo_output, args.bon_dpo_output]:
+    for out in [args.sft_output, args.dpo_output]:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         Path(out).write_text("")  # truncate
 
-    totals = {"pd": 0, "baseline": 0, "bon": 0, "dpo": 0, "bon_dpo": 0}
+    totals = {"sft": 0, "dpo": 0}
 
     for domain in args.domains:
         domain_dir = Path(args.raw_dir) / domain
@@ -396,42 +395,29 @@ def main():
         # Each domain gets its own allowed task IDs → no cross-domain ID collision
         allowed_ids = _get_split_ids(args.split, [domain])
         n_ids = len(allowed_ids) if allowed_ids else "all"
-        print(f"\n[{domain}] split='{args.split}', {n_ids} task IDs allowed")
+        print(f"\n[{domain}] split='{args.split}', source='{args.source}', {n_ids} task IDs allowed")
 
         import tempfile, os
-        tmp_sft     = Path(tempfile.mktemp(suffix=".jsonl"))
-        tmp_bl      = Path(tempfile.mktemp(suffix=".jsonl"))
-        tmp_bon     = Path(tempfile.mktemp(suffix=".jsonl"))
-        tmp_dpo     = Path(tempfile.mktemp(suffix=".jsonl"))
-        tmp_bon_dpo = Path(tempfile.mktemp(suffix=".jsonl"))
+        tmp_sft = Path(tempfile.mktemp(suffix=".jsonl"))
+        tmp_dpo = Path(tempfile.mktemp(suffix=".jsonl"))
 
-        n_sft     = build_sft_dataset(domain_dir, tmp_sft, "pd",       allowed_ids)
-        n_bl      = build_sft_dataset(domain_dir, tmp_bl,  "baseline", allowed_ids)
-        n_bon     = build_sft_dataset(domain_dir, tmp_bon, "bon",      allowed_ids)
-        n_dpo     = build_dpo_dataset(domain_dir, tmp_dpo, args.min_score_gap, allowed_ids)
-        n_bon_dpo = build_bon_dpo_dataset(domain_dir, tmp_bon_dpo, allowed_ids)
+        n_sft = build_sft_dataset(domain_dir, tmp_sft, args.source, allowed_ids)
+        n_dpo = build_dpo_dataset(domain_dir, tmp_dpo, args.min_score_gap, allowed_ids) if args.source == "pd" else 0
 
-        _append_jsonl(tmp_sft,     Path(args.sft_output))
-        _append_jsonl(tmp_bl,      Path(args.sft_baseline_output))
-        _append_jsonl(tmp_bon,     Path(args.sft_bon_output))
-        _append_jsonl(tmp_dpo,     Path(args.dpo_output))
-        _append_jsonl(tmp_bon_dpo, Path(args.bon_dpo_output))
+        _append_jsonl(tmp_sft, Path(args.sft_output))
+        if n_dpo > 0:
+            _append_jsonl(tmp_dpo, Path(args.dpo_output))
 
-        for p in [tmp_sft, tmp_bl, tmp_bon, tmp_dpo, tmp_bon_dpo]:
+        for p in [tmp_sft, tmp_dpo]:
             p.unlink(missing_ok=True)
 
-        totals["pd"]      += n_sft
-        totals["baseline"] += n_bl
-        totals["bon"]     += n_bon
-        totals["dpo"]     += n_dpo
-        totals["bon_dpo"] += n_bon_dpo
+        totals["sft"] += n_sft
+        totals["dpo"] += n_dpo
 
-    print(f"\n=== Combined summary (domains={args.domains}, split='{args.split}') ===")
-    print(f"  SFT (PD):           {totals['pd']} samples  → {args.sft_output}")
-    print(f"  SFT (baseline):     {totals['baseline']} samples  → {args.sft_baseline_output}")
-    print(f"  SFT (BoN):          {totals['bon']} samples  → {args.sft_bon_output}")
-    print(f"  DPO pairs (PD):     {totals['dpo']} pairs    → {args.dpo_output}")
-    print(f"  DPO pairs (BoN ep): {totals['bon_dpo']} pairs    → {args.bon_dpo_output}")
+    print(f"\n=== Combined summary (domains={args.domains}, split='{args.split}', source='{args.source}') ===")
+    print(f"  SFT ({args.source}):  {totals['sft']} samples → {args.sft_output}")
+    if args.source == "pd":
+        print(f"  DPO pairs (PD): {totals['dpo']} pairs  → {args.dpo_output}")
 
 
 if __name__ == "__main__":

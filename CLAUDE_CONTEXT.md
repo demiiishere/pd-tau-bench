@@ -343,7 +343,10 @@ python -m src.data_generation.generate_bon \
 - 项目路径：`/user/zhujiatong/pd-tau-bench/`
 - 模型路径：`/user/zhujiatong/models/Qwen3-8B`
 - LoRA 路径：`/user/zhujiatong/outputs_pd/sft_bon/final/` 和 `sft_pd/final/`
-- vLLM conda 环境：`vllm-env`（已配好，直接用）
+- 训练 conda 环境：`pd-qwen3-8b`
+- 推理 conda 环境：`vllm-env`
+- **网络限制**：服务器无公网访问，只能用 HF mirror（`https://hf-mirror.com`）、清华镜像（`https://pypi.tuna.tsinghua.edu.cn`）、USTC 镜像等国内源
+- **conda 初始化**：每次新终端必须先执行 `source /user/zhujiatong/miniconda3/bin/activate`，之后才能 `conda activate <env>`
 
 ### 6. 运行训练
 
@@ -358,8 +361,9 @@ python -m src.data_generation.generate_bon \
 # base model: /user/zhujiatong/models/Qwen3-8B (服务器路径)
 
 # ── 待跑（在服务器 VS Code 终端里）────────────────────────────────
+source /user/zhujiatong/miniconda3/bin/activate   # 每次新终端必须先执行
 cd /user/zhujiatong/pd-tau-bench
-conda activate pd-tau-bench   # 训练用这个环境（不是 vllm-env）
+conda activate pd-qwen3-8b   # 训练用这个环境（不是 vllm-env）
 
 # E1: SFT on standard
 python3.11 -m src.training.sft_train \
@@ -389,10 +393,11 @@ python3.11 -m src.training.dpo_train \
 **Step 1：在 VS Code 服务器终端里启动 vLLM**
 
 ```bash
+source /user/zhujiatong/miniconda3/bin/activate   # 每次新终端必须先执行
 cd /user/zhujiatong/pd-tau-bench
 git pull
 conda activate vllm-env
-bash scripts/start_vllm.sh bon   # bon 或 pd，启动对应 LoRA
+bash scripts/start_vllm.sh bon   # bon | pd | dpo，启动对应 LoRA
 # 等 ~30s，看到 "Application startup complete"
 curl http://localhost:8001/v1/models   # 验证：应返回含 "finetuned" 的 JSON
 ```
@@ -411,28 +416,182 @@ cd /Users/zhujiatong/pd-tau-bench
 # 先验证端口转发（换成 PORTS 面板显示的本地端口）
 curl http://localhost:8001/v1/models
 
+# E0: 零样本 baseline（vLLM serve base model，不加 LoRA；--agent-model 用完整路径）
 python3.11 -m src.evaluation.eval_on_tau_bench \
-    --domain retail \
+    --domain retail airline \
+    --split test \
+    --agent-model "openai//user/zhujiatong/models/Qwen3-8B" \
+    --vllm-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 \
+    --output-dir outputs/results/zero_shot
+
+# E2: BoN SFT（先 bash scripts/start_vllm.sh bon）
+python3.11 -m src.evaluation.eval_on_tau_bench \
+    --domain retail airline \
     --split test \
     --agent-model openai/finetuned \
     --vllm-url http://localhost:8001/v1 \
     --user-model openai/qwen-plus \
     --num-trials 3 \
     --output-dir outputs/results/sft_bon
-# airline 同理
+
+# E3: PD SFT（先 bash scripts/start_vllm.sh pd）
+python3.11 -m src.evaluation.eval_on_tau_bench \
+    --domain retail airline \
+    --split test \
+    --agent-model openai/finetuned \
+    --vllm-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 \
+    --output-dir outputs/results/sft_pd
+
+# E4: DPO（先 bash scripts/start_vllm.sh dpo）
+python3.11 -m src.evaluation.eval_on_tau_bench \
+    --domain retail airline \
+    --split test \
+    --agent-model openai/finetuned \
+    --vllm-url http://localhost:8001/v1 \
+    --user-model openai/qwen-plus \
+    --num-trials 3 \
+    --output-dir outputs/results/sft_pd_dpo
 ```
 
-**路由机制**（eval_on_tau_bench.py 内部）：
-- `OPENAI_API_BASE` = vLLM URL（全局，agent model 走这里）
-- DashScope 凭据通过 `user_model_args` 的 per-call `api_base`/`api_key` 传入 user simulator
+**路由机制**（eval_on_tau_bench.py 内部，fully explicit — 无全局 OPENAI_API_BASE）：
+- Agent model → per-call `api_base=vLLM_URL, api_key="fake"` 传入 `agent_model_args`
+- User simulator → per-call `api_base=DashScope, api_key=DASHSCOPE_API_KEY` 传入 `user_model_args`
 - 评估只在 `--split test` 的任务上进行（retail 34 tasks，airline 15 tasks）
+
+---
+
+## Phase C — On-policy 自蒸馏（Session 8+，全程在服务器上）
+
+**思路**：用 Qwen3-8B base（thinking ON）自己生成 PD 轨迹，迭代 fine-tune 自己。消除 distribution mismatch（teacher=Qwen-Plus）。
+
+### ✅ Round 0 完成情况
+
+#### 数据生成（原始成功样本数）
+
+| 方法 | retail 成功/总计 | airline 成功/总计 | 说明 |
+|------|----------------|-----------------|------|
+| PD (K=5, H=2) | 73/240 (30.4%) | 38/105 (36.2%) | oracle 47.8%, avg pass@1 32.2% |
+| BoN N=3 | 60/239 (25.1%) | 39/105 (37.1%) | oracle 41.7%, avg pass@1 28.8% |
+
+PD oracle 比 BoN 高 +6.1pp（retail 成功样本多 +13 个）；airline 两者几乎相同（38 vs 39）。
+
+#### SFT 训练结果
+
+| 模型 | 样本数 | train_loss | token_acc |
+|------|--------|-----------|-----------|
+| PD SFT | 111条 | 1.141 | 0.7247 |
+| BoN SFT | ~100条 | — | — |
+| Mixed SFT | ~211条 | — | — |
+
+设置：5 epochs，max_length=16384，eval_fraction=0，thinking ON 数据。
+
+#### 评估结果（test split，3 trials，user=Qwen3-8B）
+
+| 模型 | retail pass@1 | retail pass@3 | retail oracle | airline pass@1 | airline pass@3 | airline oracle |
+|-----|:---:|:---:|:---:|:---:|:---:|:---:|
+| Base Qwen3-8B | 0.2157 | 0.1176 | 0.3529 | **0.1556** | 0.0667 | **0.2667** |
+| PD SFT（111条） | **0.2647** | **0.1176** | 0.4412 | 0.1333 | 0.0667 | 0.2000 |
+| BoN SFT（~100条） | 0.2353 | 0.0588 | **0.4706** | **0.1778** | 0.0667 | **0.2667** |
+| Mixed SFT（PD+BoN） | 0.1961 | 0.0882 | 0.3529 | 0.0667 | 0.0667 | 0.0667 |
+
+**⚠️ 注意**：此处 user=Qwen3-8B，与 Phase B（user=Qwen-Plus）结果不可直接比较。
+
+#### 关键结论
+
+1. **retail**：PD 数据多 +13 个样本，且 oracle 差距更大 → PD SFT 赢（+23% over base）
+2. **airline**：两者样本数几乎相同（38 vs 39）→ BoN SFT 赢（+14% over base），说明 PD value function 在 airline 上噪声更大
+3. **Mixed 失败**：合并数据训练 airline 几乎崩溃（oracle=0.0667），轨迹风格冲突 + 数据分布偏 retail
+
+#### Value Function 弱点（现有实现的根本问题）
+
+| 信号 | 问题 |
+|------|------|
+| delta_progress (0.35) | **只比对 tool 名字，不看参数**。airline 任务需要精确参数（航班号/座位类），name 相同 args 不同无法区分 |
+| user_sentiment (0.15) | **Qwen3-8B 用中文回复时英文关键词全部失效**，几乎恒返回 0.5 |
+| termination (0.15) | H=2 几乎不会完成任务，**恒返回 0.4**，对所有候选无区分度 |
+| env_assertions (0.10) | 文档说 "rarely fires in H=2"，**实际无效** |
+| foresight_health (0.25) | 还算有效，但重复调用判断过严（有时合理调两次同名 tool） |
+
+**实际只有 delta_progress + foresight_health 起作用，且 airline 任务 delta_progress 也很弱。**
+
+### start_vllm.sh 变体说明
+
+| 变体 | 用途 | thinking | LoRA |
+|------|------|---------|------|
+| `base` | 数据生成 / base 对照评估 | ON（默认）| 无，`--served-model-name finetuned` |
+| `pd_onpolicy` | 评估 PD on-policy 模型 | ON | `sft_pd_onpolicy/final` |
+| `bon_onpolicy` | 评估 BoN N=3 消融模型 | ON | `sft_bon3_onpolicy/final` |
+| `mixed_onpolicy` | 评估 PD+BoN 混合模型 | ON | `sft_mixed_onpolicy/final` |
+| `bon/pd/dpo` | 评估 off-policy 模型 | OFF（强制）| 对应路径 |
+
+`base` variant 已加 `--served-model-name finetuned`，所以 `--agent-model openai/finetuned` 对 base 和 fine-tuned 都适用。
+
+### eval_on_tau_bench.py 关键参数
+
+```bash
+--local           # user model 也走本地 vLLM（不需要 DashScope/外网）
+--enable-thinking # agent model 开 thinking ON（on-policy 模型必须加）
+```
+
+`--local` 时 user simulator 走同一个 vLLM，`enable_thinking=False`（user 不需要思考）。
+脚本内已自动设置 `no_proxy=localhost,127.0.0.1`，无需手动 export。
+
+### build_dataset.py 参数
+
+```bash
+# PD SFT + DPO
+python -m src.data_generation.build_dataset --raw-dir data/raw_trajectories_onpolicy --sft-output data/sft_dataset_onpolicy/train.jsonl --dpo-output data/dpo_dataset_onpolicy/train.jsonl
+
+# BoN SFT（--source bon，读 *_bon_n*.json）
+python -m src.data_generation.build_dataset --raw-dir data/raw_trajectories_bon3 --sft-output data/sft_dataset_bon3/train.jsonl --source bon
+```
+
+### Round N 完整执行流程
+
+**Step 1：数据生成（终端 A=vllm-env，终端 B=pd-qwen3-8b）**
+
+```bash
+# 终端 A（Round 0 用 base，Round 1+ 用上一轮 fine-tuned model）
+bash scripts/start_vllm.sh base          # Round 0
+bash scripts/start_vllm.sh pd_onpolicy   # Round 1+（需先更新 sft_pd_onpolicy 路径）
+no_proxy=localhost curl http://localhost:8001/v1/models  # 验证
+
+# 终端 B（支持断点续传，已有文件自动跳过）
+python -m src.data_generation.generate_trajectories_onpolicy --domain retail airline --K 5 --H 2 --num-trials 3 --max-concurrency 3 --output-dir data/raw_trajectories_onpolicy_round1
+```
+
+**Step 2：构建数据集**
+
+```bash
+python -m src.data_generation.build_dataset --raw-dir data/raw_trajectories_onpolicy_round1 --sft-output data/sft_dataset_onpolicy_round1/train.jsonl --dpo-output data/dpo_dataset_onpolicy_round1/train.jsonl
+```
+
+**Step 3：SFT 训练（先 kill vLLM）**
+
+```bash
+python -m src.training.sft_train_onpolicy --model /user/zhujiatong/models/Qwen3-8B --dataset data/sft_dataset_onpolicy_round1/train.jsonl --output /user/zhujiatong/outputs_pd/sft_pd_onpolicy_round1 --eval-fraction 0
+```
+
+**Step 4：评估**
+
+```bash
+bash scripts/start_vllm.sh pd_onpolicy   # 注意：需修改 start_vllm.sh 里 pd_onpolicy 的路径指向 round1
+
+python -m src.evaluation.eval_on_tau_bench --domain retail airline --split test --agent-model openai/finetuned --vllm-url http://localhost:8001/v1 --user-model openai/finetuned --local --enable-thinking --num-trials 3 --output-dir outputs/results/sft_pd_onpolicy_round1 --max-concurrency 5
+```
 
 ### 常见坑（服务器专属）
 
-- **vLLM 启动慢**：首次加载 Qwen3-8B + LoRA 约需 30-60s，等 `Application startup complete`
-- **普通 `ssh -N -L` 不通**：Teleport ProxyCommand 不支持端口转发，必须用 VS Code PORTS 面板
-- **conda 在 bash 脚本里 activate 失败**：需要先 `eval "$(conda shell.bash hook)"`，`start_vllm.sh` 已处理
-- **VS Code 端口映射到非 8001**：以 PORTS 面板显示的本地端口为准，`--vllm-url` 里改成对应端口
+- **每次新终端必须先初始化 conda**：执行 `source /user/zhujiatong/miniconda3/bin/activate`
+- **训练环境是 `pd-qwen3-8b`，推理环境是 `vllm-env`**，不要搞混
+- **服务器无公网**：pip 用清华源，模型用 HF mirror（`export HF_ENDPOINT=https://hf-mirror.com`）
+- **vLLM 启动慢**：首次加载约需 30-60s，等 `Application startup complete`
+- **命令不要用反斜杠换行**：服务器上 `\` 后有空格会失效，写成一行
+- **手动 curl 用** `no_proxy=localhost curl http://localhost:8001/v1/models`（脚本内已自动绕过代理）
 
 ---
 
@@ -570,47 +729,32 @@ python -m src.data_generation.build_dataset
 # 见 CLAUDE_CONTEXT.md "Phase B 训练策略" 小节
 
 # E2: SFT on BoN（295 条，先跑做 debug，最快）
+cd /user/zhujiatong/pd-tau-bench
 python -m src.training.sft_train \
-    --model /root/autodl-tmp/models/Qwen3-8B \
-    --dataset data/sft_dataset/train_bon.jsonl \
-    --output /root/autodl-tmp/outputs/sft_bon
+    --model /user/zhujiatong/models/Qwen3-8B \
+    --dataset /user/zhujiatong/pd-tau-bench/data/sft_dataset/train_bon.jsonl \
+    --output /user/zhujiatong/pd-tau-bench/outputs_pd/sft_bon
     # [+ --general-data data/general/glaive_3k.jsonl 如果已准备]
 
 # E3: SFT on PD（197 条，核心实验）
+cd /user/zhujiatong/pd-tau-bench
 python -m src.training.sft_train \
-    --model /root/autodl-tmp/models/Qwen3-8B \
-    --dataset data/sft_dataset/train.jsonl \
-    --output /root/autodl-tmp/outputs/sft_pd
+    --model /user/zhujiatong/models/Qwen3-8B \
+    --dataset /user/zhujiatong/pd-tau-bench/data/sft_dataset/train.jsonl \
+    --output /user/zhujiatong/pd-tau-bench/outputs_pd/sft_pd
 
 # E2+: DPO on BoN episode-level pairs（BoN+DPO baseline，与 E4 对比）
-python -m src.training.dpo_train \
-    --sft-model /root/autodl-tmp/outputs/sft_bon/final \
-    --dataset data/dpo_dataset/train_bon_episode.jsonl \
-    --output /root/autodl-tmp/outputs/dpo_bon_episode
+python -m src.training.dpo_train --sft-model /user/zhujiatong/outputs_pd/sft_bon/final --dataset data/dpo_dataset/train_bon_episode.jsonl --output /user/zhujiatong/outputs_pd/dpo_bon_episode
 
 # E4: DPO on PD turn-level pairs（我们的方法）
-python -m src.training.dpo_train \
-    --sft-model /root/autodl-tmp/outputs/sft_pd/final \
-    --dataset data/dpo_dataset/train.jsonl \
-    --output /root/autodl-tmp/outputs/dpo_pd \
-    --min-score-gap 0.10
+python -m src.training.dpo_train --sft-model /user/zhujiatong/outputs_pd/sft_pd/final --dataset data/dpo_dataset/train.jsonl --output /user/zhujiatong/outputs_pd/dpo_pd --min-score-gap 0.10
+
+# 注意：反斜杠续行在服务器终端可能有问题（\ 后有空格就失效），推荐写成一行
 ```
 
 ### 3. 评估
 
-```bash
-# 终端 1: serve 模型
-vllm serve /root/autodl-tmp/outputs/sft_pd/final \
-    --port 8001 --trust-remote-code --dtype bfloat16
-
-# 终端 2: 评估（retail + airline test split）
-python -m src.evaluation.eval_on_tau_bench \
-    --domain retail airline --split test \
-    --model-url http://localhost:8001/v1 \
-    --user-model openai/qwen-plus \
-    --num-trials 3 \
-    --output results/sft_pd_eval.json
-```
+见 "7. 运行评估（完整步骤）" 小节，使用 `scripts/start_vllm.sh` + 本地 Mac 跑评估。
 
 ---
 
@@ -651,8 +795,13 @@ src/predictive_decoding/tau_bench_adapter.py   L28  get_tasks()
 src/predictive_decoding/tau_bench_adapter.py   L37  load_task_split() ← 新增
 src/predictive_decoding/tau_bench_adapter.py   L114 save/restore_orchestrator_state()
 src/predictive_decoding/value_function.py           compute_value()
-src/data_generation/generate_trajectories.py  批量生成 PD 轨迹（支持 --split）
-src/data_generation/generate_baseline.py      baseline 生成（支持 --split，含时间追踪）
-src/data_generation/generate_bon.py           BoN 生成 ← 新增
-src/data_generation/build_dataset.py          SFT/DPO 构建（DPO 格式已修复，支持 --split）
+src/data_generation/generate_trajectories.py          批量生成 PD 轨迹（off-policy，Qwen-Plus）
+src/data_generation/generate_baseline.py              baseline 生成（off-policy）
+src/data_generation/generate_bon.py                   BoN 生成（off-policy）
+src/data_generation/generate_trajectories_onpolicy.py PD 轨迹生成（on-policy，本地 vLLM）← Phase C
+src/data_generation/generate_bon_onpolicy.py          BoN 轨迹生成（on-policy）← Phase C
+src/data_generation/build_dataset.py                  SFT/DPO 构建（--source pd|baseline|bon）
+src/training/sft_train_onpolicy.py                    on-policy SFT（thinking ON，5 epochs）← Phase C
+src/evaluation/eval_on_tau_bench.py                   评估（--local --enable-thinking 用于 Phase C）
+scripts/start_vllm.sh                                 vLLM 启动（base/pd_onpolicy/bon/pd/dpo）
 ```

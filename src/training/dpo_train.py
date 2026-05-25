@@ -27,7 +27,8 @@ def train_dpo(
     dpo_dataset_path: str,
     output_dir: str,
     min_score_gap: float = 0.05,
-    eval_fraction: float = 0.05,
+    eval_fraction: float = 0.0,
+    max_steps: int = -1,
 ):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import DPOConfig, DPOTrainer
@@ -65,41 +66,18 @@ def train_dpo(
     # ── Dataset ───────────────────────────────────────────────────────────────
     # Format from build_dataset.py:
     #   {"prompt": [...msgs], "chosen": {msg_dict}, "rejected": {msg_dict}, "score_gap": float}
-    # TRL DPOTrainer expects plain strings: {"prompt": str, "chosen": str, "rejected": str}
+    # trl 1.4+ conversational format expects:
+    #   prompt: list of message dicts, chosen/rejected: list of message dicts (wrap single dict)
     dataset = load_dataset("json", data_files=dpo_dataset_path, split="train")
     dataset = dataset.filter(lambda x: x["score_gap"] >= min_score_gap)
     if len(dataset) == 0:
         raise ValueError(f"Empty DPO dataset after filtering score_gap >= {min_score_gap}")
     print(f"DPO dataset: {len(dataset)} pairs (score_gap >= {min_score_gap})")
 
-    def preprocess_dpo(examples):
-        prompts, chosens, rejecteds = [], [], []
-        for prompt_msgs, chosen_msg, rejected_msg in zip(
-            examples["prompt"], examples["chosen"], examples["rejected"]
-        ):
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_msgs,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            chosen_full = tokenizer.apply_chat_template(
-                prompt_msgs + [chosen_msg],
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            rejected_full = tokenizer.apply_chat_template(
-                prompt_msgs + [rejected_msg],
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            prompts.append(prompt_text)
-            chosens.append(chosen_full[len(prompt_text):])
-            rejecteds.append(rejected_full[len(prompt_text):])
-        return {"prompt": prompts, "chosen": chosens, "rejected": rejecteds}
-
+    # Wrap chosen/rejected single-message dicts into lists (trl 1.4 conversational format).
+    # Drop score_gap which DPOTrainer doesn't understand.
     dataset = dataset.map(
-        preprocess_dpo,
-        batched=True,
+        lambda x: {"chosen": [x["chosen"]], "rejected": [x["rejected"]]},
         remove_columns=["score_gap"],
     )
 
@@ -121,6 +99,7 @@ def train_dpo(
     training_args = DPOConfig(
         output_dir=output_dir,
         num_train_epochs=1,
+        max_steps=max_steps,  # -1 = no limit; set >0 for quick smoke tests
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         learning_rate=1e-6,
@@ -134,7 +113,6 @@ def train_dpo(
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_length=8192,
-        max_prompt_length=6144,
     )
 
     trainer = DPOTrainer(
@@ -143,7 +121,7 @@ def train_dpo(
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # replaces deprecated tokenizer= param
         peft_config=lora_config,
     )
 
@@ -167,8 +145,14 @@ def main():
     parser.add_argument(
         "--eval-fraction",
         type=float,
-        default=0.05,
+        default=0.0,
         help="Fraction of data to use for eval (0 to disable)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=-1,
+        help="Max training steps (-1 = full epoch). Use 2-5 for a quick smoke test.",
     )
     args = parser.parse_args()
     train_dpo(
@@ -177,6 +161,7 @@ def main():
         args.output,
         args.min_score_gap,
         args.eval_fraction,
+        args.max_steps,
     )
 
 

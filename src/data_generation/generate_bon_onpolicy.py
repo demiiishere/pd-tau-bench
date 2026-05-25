@@ -1,25 +1,25 @@
 """
-Generate Best-of-N (BoN) trajectories.
+Generate Best-of-N (BoN) trajectories using local Qwen3-8B via vLLM (on-policy).
 
-BoN samples N full episodes with temperature=0.8, then picks the one with the
-highest reward. This is the key comparison baseline (E2 in the research plan):
-it uses the same inference budget as PD but without lookahead.
+Both agent and user simulator use the local vLLM endpoint — no internet / DashScope needed.
+Agent runs with thinking ON; user simulator runs with thinking OFF.
 
-Run:
-    # Train split (default)
-    python -m src.data_generation.generate_bon \
-        --domain retail airline --N 5 \
-        --model openai/qwen-plus --max-concurrency 5
+Run on server (vllm-env must be serving base model first):
+    bash scripts/start_vllm.sh base   # serve base Qwen3-8B, no LoRA, thinking ON
 
-    # Debug: single task
-    python -m src.data_generation.generate_bon \
-        --domain retail --task-ids 0 --N 3 --model openai/qwen-plus
+Then in pd-qwen3-8b env:
+    # Single task smoke test
+    python -m src.data_generation.generate_bon_onpolicy \
+        --domain retail --task-ids 0 --N 3
+
+    # Full train split
+    python -m src.data_generation.generate_bon_onpolicy \
+        --domain retail airline --N 5 --max-concurrency 5
 """
 
 import argparse
 import json
 import os
-import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,13 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from loguru import logger
 
-
-def _safe_id(task_id: str) -> str:
-    """Sanitize task_id for use in filenames (telecom IDs contain |, [], :)."""
-    return re.sub(r'[^\w\-.]', '_', str(task_id))
-
 from src.predictive_decoding.tau_bench_adapter import (
-    configure_litellm_for_dashscope,
     create_orchestrator,
     get_tasks,
     load_task_split,
@@ -43,8 +37,24 @@ from src.predictive_decoding.tau_bench_adapter import (
 from src.predictive_decoding.core import (
     _compute_final_reward,
     _extract_conversation,
+    _sum_usage,
+    _add_usage,
+    _ZERO_USAGE,
 )
 from tau2.data_model.simulation import TerminationReason
+
+
+def _configure_vllm(vllm_url: str) -> None:
+    """Route all openai/* calls to the local vLLM endpoint."""
+    import litellm
+    os.environ["OPENAI_API_KEY"] = "fake"
+    os.environ["OPENAI_API_BASE"] = vllm_url
+    litellm.drop_params = True
+    # Bypass HTTP proxy for localhost — server proxy would return 502 otherwise
+    for var in ("no_proxy", "NO_PROXY"):
+        existing = os.environ.get(var, "")
+        if "localhost" not in existing:
+            os.environ[var] = f"localhost,127.0.0.1,{existing}".strip(",")
 
 
 def run_bon_episode(
@@ -52,24 +62,21 @@ def run_bon_episode(
     task,
     agent_model: str,
     user_model: str,
+    agent_model_args: dict,
+    user_model_args: dict,
     temperature: float = 0.8,
     max_steps: int = 30,
-    enable_thinking: bool = False,
 ) -> dict:
-    """
-    Run a single episode with stochastic decoding (temperature > 0).
-    Used as the building block for Best-of-N.
-    """
+    """Run a single episode with stochastic decoding. Building block for BoN."""
     episode_start = time.time()
-    agent_extra = {"extra_body": {"enable_thinking": True}} if enable_thinking else {}
 
     orch = create_orchestrator(
         domain=domain,
         task=task,
         agent_model=agent_model,
         user_model=user_model,
-        agent_model_args={"temperature": temperature, **agent_extra},
-        user_model_args={"temperature": 0.0},
+        agent_model_args={**agent_model_args, "temperature": temperature},
+        user_model_args=user_model_args,
         max_steps=max_steps,
     )
     orch.initialize()
@@ -84,8 +91,6 @@ def run_bon_episode(
     final_reward = _compute_final_reward(orch, task)
     conversation = _extract_conversation(orch)
     wall_time_s = time.time() - episode_start
-
-    from src.predictive_decoding.core import _sum_usage
     traj_usage = _sum_usage(orch.get_trajectory())
 
     return {
@@ -108,50 +113,37 @@ def run_bon_task(
     N: int,
     agent_model: str,
     user_model: str,
+    agent_model_args: dict,
+    user_model_args: dict,
     temperature: float = 0.8,
     max_steps: int = 30,
     output_dir: Path = None,
-    enable_thinking: bool = False,
 ) -> dict:
-    """
-    Run N episodes for a single task and pick the best one (oracle best reward).
-
-    Saves all N individual trajectories and a summary JSON with oracle reward.
-    Returns a summary dict.
-    """
+    """Run N episodes for a single task and pick the best (oracle reward)."""
     task_start = time.time()
     samples = []
-    total_api_calls = 0
 
     for n in range(N):
-        sample_path = (output_dir / f"task_{_safe_id(task.id)}_bon_n{n}.json") if output_dir else None
-        # Resume: load existing sample instead of re-generating
-        if sample_path is not None and sample_path.exists():
-            result = json.load(open(sample_path))
-            result["sample_idx"] = n
-            samples.append(result)
-            logger.debug(f"  BoN sample {n}/{N}: loaded from cache")
-            continue
         try:
             result = run_bon_episode(
                 domain=domain,
                 task=task,
                 agent_model=agent_model,
                 user_model=user_model,
+                agent_model_args=agent_model_args,
+                user_model_args=user_model_args,
                 temperature=temperature,
                 max_steps=max_steps,
-                enable_thinking=enable_thinking,
             )
             result["sample_idx"] = n
             samples.append(result)
-            total_api_calls += result.get("api_calls_approx", 0)
             logger.debug(
                 f"  BoN sample {n}/{N}: reward={result['final_reward']}, "
                 f"steps={result['num_steps']}"
             )
 
-            # Save individual sample
-            if sample_path is not None:
+            if output_dir is not None:
+                sample_path = output_dir / f"task_{task.id}_bon_n{n}.json"
                 with open(sample_path, "w", encoding="utf-8") as f:
                     json.dump(result, f, indent=2, ensure_ascii=False)
         except Exception as e:
@@ -159,8 +151,6 @@ def run_bon_task(
 
     if not samples:
         raise RuntimeError(f"All {N} BoN samples failed for task {task.id}")
-    if len(samples) < N:
-        raise RuntimeError(f"Only {len(samples)}/{N} BoN samples completed for task {task.id}")
 
     best_sample = max(samples, key=lambda s: s["final_reward"])
     oracle_reward = best_sample["final_reward"]
@@ -169,8 +159,6 @@ def run_bon_task(
 
     wall_time_s = time.time() - task_start
 
-    # Sum token usage across all N samples
-    from src.predictive_decoding.core import _sum_usage, _add_usage, _ZERO_USAGE
     total_tokens = dict(_ZERO_USAGE)
     for s in samples:
         total_tokens = _add_usage(total_tokens, s.get("tokens", _ZERO_USAGE))
@@ -190,7 +178,7 @@ def run_bon_task(
     }
 
     if output_dir is not None:
-        summary_path = output_dir / f"task_{_safe_id(task.id)}_bon_summary.json"
+        summary_path = output_dir / f"task_{task.id}_bon_summary.json"
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
@@ -210,17 +198,40 @@ def main():
                         help="Number of samples per task for BoN.")
     parser.add_argument("--temperature", type=float, default=0.8,
                         help="Sampling temperature (should be > 0 for diversity).")
-    parser.add_argument("--model", default="openai/qwen-plus")
-    parser.add_argument("--output-dir", default="data/raw_trajectories")
-    parser.add_argument("--task-split", default="base",
-                        help="tau2-bench internal split name (usually 'base')")
+    parser.add_argument(
+        "--vllm-url", default="http://localhost:8001/v1",
+        help="vLLM OpenAI-compatible endpoint.",
+    )
+    parser.add_argument(
+        "--agent-model", default="openai/finetuned",
+        help="Agent model name as seen by litellm (matches --served-model-name in vLLM).",
+    )
+    parser.add_argument(
+        "--user-model", default=None,
+        help="User simulator model (default: same as --agent-model).",
+    )
+    parser.add_argument("--output-dir", default="data/raw_trajectories_onpolicy")
+    parser.add_argument("--task-split", default="base")
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--max-concurrency", type=int, default=5)
-    parser.add_argument("--enable-thinking", action="store_true",
-                        help="Pass enable_thinking=True to the agent model.")
     args = parser.parse_args()
 
-    configure_litellm_for_dashscope()
+    if args.user_model is None:
+        args.user_model = args.agent_model
+
+    _configure_vllm(args.vllm_url)
+
+    agent_model_args = {
+        "api_base": args.vllm_url,
+        "api_key": "fake",
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+    }
+    user_model_args = {
+        "temperature": 0.0,
+        "api_base": args.vllm_url,
+        "api_key": "fake",
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
 
     jobs = []
     for domain in args.domain:
@@ -241,7 +252,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
         for task in tasks:
-            summary_path = output_dir / f"task_{_safe_id(task.id)}_bon_summary.json"
+            summary_path = output_dir / f"task_{task.id}_bon_summary.json"
             if summary_path.exists():
                 logger.info(f"Skip existing: {summary_path.name}")
                 continue
@@ -256,7 +267,8 @@ def main():
     failures = 0
     oracle_rewards = []
     avg_rewards = []
-    total_api_calls = 0
+    success_counts = []   # per-task: how many of the N samples succeeded
+    timing_rows = []      # for timing summary JSON
     start = time.time()
 
     def run_job(job):
@@ -265,12 +277,13 @@ def main():
             domain=domain,
             task=task,
             N=args.N,
-            agent_model=args.model,
-            user_model=args.model,
+            agent_model=args.agent_model,
+            user_model=args.user_model,
+            agent_model_args=agent_model_args,
+            user_model_args=user_model_args,
             temperature=args.temperature,
             max_steps=args.max_steps,
             output_dir=output_dir,
-            enable_thinking=args.enable_thinking,
         )
 
     with ThreadPoolExecutor(max_workers=args.max_concurrency) as executor:
@@ -279,18 +292,27 @@ def main():
             domain, task, _ = futures[future]
             try:
                 result = future.result()
-                oracle_r = result["oracle_reward"]
-                avg_r = result["avg_reward"]
-                n_ok = result["success_count"]
-                api_c = result.get("api_calls_approx", 0)
-                total_api_calls += api_c
-                oracle_rewards.append(oracle_r)
-                avg_rewards.append(avg_r)
+                oracle_rewards.append(result["oracle_reward"])
+                avg_rewards.append(result["avg_reward"])
+                success_counts.append(result["success_count"])
+                task_time = result.get("wall_time_s", 0)
+                task_tokens = result.get("tokens", {}).get("total_tokens", 0)
                 logger.info(
                     f"[{domain}] Task {task.id}: "
-                    f"oracle={oracle_r}, avg={avg_r:.3f}, "
-                    f"successes={n_ok}/{args.N}, api_calls≈{api_c}"
+                    f"oracle={result['oracle_reward']}, avg={result['avg_reward']:.3f}, "
+                    f"successes={result['success_count']}/{args.N}, "
+                    f"time={task_time:.1f}s, tokens={task_tokens}"
                 )
+                timing_rows.append({
+                    "domain": domain,
+                    "task_id": str(task.id),
+                    "N": args.N,
+                    "oracle_reward": result["oracle_reward"],
+                    "avg_reward": result["avg_reward"],
+                    "success_count": result["success_count"],
+                    "total_time_s": round(task_time, 2),
+                    "total_tokens": task_tokens,
+                })
                 successes += 1
             except Exception as e:
                 logger.error(f"[{domain}] Task {task.id} FAILED: {e}")
@@ -299,16 +321,32 @@ def main():
     elapsed = time.time() - start
 
     if oracle_rewards:
-        pass1 = sum(oracle_rewards) / len(oracle_rewards)
-        avg_pass = sum(avg_rewards) / len(avg_rewards)
-        logger.info(
-            f"\nBoN Done in {elapsed:.1f}s: {successes} tasks succeeded, {failures} failed"
-            f"\n  Oracle pass@{args.N}: {pass1:.3f} ({sum(oracle_rewards)}/{len(oracle_rewards)})"
-            f"\n  Avg pass@1:    {avg_pass:.3f}"
-            f"\n  Total api_calls≈{total_api_calls}"
-        )
+        n_tasks = len(oracle_rewards)
+        n_oracle = sum(oracle_rewards)
+        avg_pass1 = sum(avg_rewards) / n_tasks
+        avg_time = sum(r["total_time_s"] for r in timing_rows) / max(len(timing_rows), 1)
+
+        # Success-count distribution
+        from collections import Counter
+        dist = Counter(success_counts)
+
+        logger.info(f"\n=== BoN (N={args.N}) — {args.domain} {args.split} split ({n_tasks} tasks) ===")
+        logger.info(f"  Oracle (任意1次成功): {int(n_oracle)}/{n_tasks} = {100*n_oracle/n_tasks:.1f}%")
+        logger.info(f"  Avg pass@1:          {avg_pass1:.3f}")
+        logger.info(f"  Avg time / task:     {avg_time:.1f}s")
+        logger.info(f"  Pass@1 分布:")
+        for k in range(args.N + 1):
+            cnt = dist.get(k, 0)
+            logger.info(f"    {k}/{args.N} 次成功: {cnt} tasks ({100*cnt/n_tasks:.0f}%)")
+
+        # Save timing summary
+        summary_path = Path(args.output_dir) / "bon_timing_summary.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(timing_rows, f, indent=2, ensure_ascii=False)
+        logger.info(f"\nTiming summary saved to: {summary_path}")
+        logger.info(f"Done in {elapsed:.1f}s: {successes} tasks OK, {failures} failed")
     else:
-        logger.info(f"\nBoN Done: {successes} succeeded, {failures} failed")
+        logger.info(f"\nBoN done: {successes} succeeded, {failures} failed")
 
 
 if __name__ == "__main__":

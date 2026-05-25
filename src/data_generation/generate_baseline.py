@@ -15,10 +15,16 @@ Run:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+
+def _safe_id(task_id: str) -> str:
+    """Sanitize task_id for use in filenames (telecom IDs contain |, [], :)."""
+    return re.sub(r'[^\w\-.]', '_', str(task_id))
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -114,6 +120,8 @@ def main():
     parser.add_argument("--task-split", default="base",
                         help="tau2-bench internal split name (usually 'base')")
     parser.add_argument("--max-steps", type=int, default=30)
+    parser.add_argument("--enable-thinking", action="store_true",
+                        help="Pass enable_thinking=True to the agent model.")
     args = parser.parse_args()
 
     configure_litellm_for_dashscope()
@@ -138,8 +146,13 @@ def main():
     successes = 0
     total_time = 0.0
     for i, task in enumerate(tasks):
+        out_path = output_dir / f"task_{_safe_id(task.id)}_baseline.json"
+        if out_path.exists():
+            logger.info(f"[{i+1}/{len(tasks)}] Task {task.id} — skip (exists)")
+            continue
         logger.info(f"[{i+1}/{len(tasks)}] Task {task.id}")
         try:
+            agent_extra = {"extra_body": {"enable_thinking": True}} if args.enable_thinking else None
             result = run_baseline_episode(
                 domain=args.domain,
                 task=task,
@@ -147,8 +160,9 @@ def main():
                 user_model=args.model,
                 temperature=args.temperature,
                 max_steps=args.max_steps,
+                agent_model_args=agent_extra,
             )
-            out_path = output_dir / f"task_{task.id}_baseline.json"
+            out_path = output_dir / f"task_{_safe_id(task.id)}_baseline.json"
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
 
