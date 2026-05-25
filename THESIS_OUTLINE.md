@@ -596,7 +596,7 @@ Qwen3-4B 的能力差距巨大，为 SFT 蒸馏提供了充足的提升空间。
 | E1b | BoN 295 | — | 8.8% | 13.3% |
 | E1c | BoN 295 | Qwen-Plus PD pairs | 0.0% | 6.7% |
 | E1a | PD 197 | — | 2.9% | 20.0% |
-| E1d | PD 197 | Qwen-Plus PD pairs (626) | 2.9% | 13.3% |
+| E1d | PD 197 | Qwen-Plus PD pairs (313) | 2.9% | 13.3% |
 
 → Phase A 的 DPO 在 retail 上全部退化（甚至 BoN-SFT+DPO 也退化）。**这与 Phase B 的 E3c 增益形成鲜明对比**。
 
@@ -1002,8 +1002,8 @@ target: 最后一条 assistant 消息（文本回复 或 tool_calls JSON）
 | E0 | — | — | 2.9% | 6.7% |
 | E1a | PD | 197 | 2.9% | 20.0% |
 | E1b | BoN | 295 | 8.8% | 13.3% |
-| E1c | BoN+DPO | 295+626 | 0.0% | 6.7% |
-| E1d | PD+DPO | 197+626 | 2.9% | 13.3% |
+| E1c | BoN+DPO | 295+313 | 0.0% | 6.7% |
+| E1d | PD+DPO | 197+313 | 2.9% | 13.3% |
 
 **C.2 Phase B（Qwen3-32B Teacher）4B 学生**
 
