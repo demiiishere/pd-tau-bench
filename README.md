@@ -1,8 +1,5 @@
 # Predictive Decoding for LLM Agent Distillation
 
-> **Undergraduate thesis project** — Fudan University, School of Data Science, 2026  
-> *When does foresight help? Distilling small LLM agents via turn-level predictive decoding.*
-
 ## Overview
 
 This repository contains the full implementation for studying **Predictive Decoding (PD)** as a data-generation strategy for distilling large teacher LLM agents into smaller student models, evaluated on the [τ²-bench](https://github.com/sierra-research/tau2-bench) conversational agent benchmark.
@@ -137,8 +134,8 @@ Final model → vLLM serving → τ²-bench evaluation
 | **E0** | Zero-shot Qwen3-4B | — | — | — | retail/airline/telecom |
 | **E1a** | Qwen-Plus PD-SFT | Qwen-Plus | PD 197 | — | retail/airline |
 | **E1b** | Qwen-Plus BoN-SFT | Qwen-Plus | BoN 295 | — | retail/airline |
-| **E1c** | Qwen-Plus BoN-SFT + DPO | Qwen-Plus | BoN 295 | 626 pairs | retail/airline |
-| **E1d** | Qwen-Plus PD-SFT + DPO | Qwen-Plus | PD 197 | 626 pairs | retail/airline |
+| **E1c** | Qwen-Plus BoN-SFT + DPO | Qwen-Plus | BoN 295 | 313 pairs | retail/airline |
+| **E1d** | Qwen-Plus PD-SFT + DPO | Qwen-Plus | PD 197 | 313 pairs | retail/airline |
 | **E3a** | 32B PD-SFT | Qwen3-32B | PD 146 | — | retail/airline/telecom |
 | **E3b** | 32B BoN-SFT | Qwen3-32B | BoN 240 | — | retail/airline/telecom |
 | **E3c** ★ | 32B BoN-SFT + PD-DPO | Qwen3-32B | BoN 240 | 298 pairs | retail/airline/telecom |
@@ -185,10 +182,6 @@ pip install -e tau2-bench/
 pip install torch --index-url https://download.pytorch.org/whl/cu126
 pip install transformers peft trl vllm litellm loguru pyyaml
 ```
-
-> **Mirror note (servers without direct internet access)**:  
-> `pip install ... -i https://mirrors.ustc.edu.cn/pypi/web/simple/`  
-> `HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-4B`
 
 ### Environment Variables
 
@@ -260,32 +253,6 @@ python -m src.evaluation.eval_on_tau_bench \
     --num-trials 3 \
     --output-dir data/results/e3c
 ```
-
----
-
-## Project Notes
-
-### Why E3d (PD-SFT + PD-DPO) collapsed
-
-E3d averaged only 1.2% across all domains — worse than zero-shot. The failure mode is "礼貌过拟合" (politeness overfitting): the PD-DPO turn-level preferences over-optimize for single-turn response quality, causing the model to lose track of when to terminate a multi-turn dialogue. Combined with PD-SFT data that has lower coverage than BoN (PD only saves the *chosen* path, not the alternatives), the model over-fits to a narrow distribution and collapses.
-
-### True PD decision rate
-
-PD is only "active" (i.e., the chosen candidate differs from greedy) on a minority of steps:
-
-| Teacher | Domain | PD-active steps |
-|---------|--------|-----------------|
-| Qwen-Plus | retail | 27% |
-| Qwen-Plus | airline | 35% |
-| Qwen3-32B | retail | 8.2% |
-| Qwen3-32B | airline | 7.2% |
-| Qwen3-32B | telecom | 7.5% |
-
-The lower PD rate for 32B explains why 32B PD ≈ 32B BoN: the teacher is often confident enough that PD defaults to greedy, providing little additional signal over BoN.
-
-### Dataset duplication bug
-
-The `sft_dataset/train.jsonl` (Qwen-Plus) contains 394 entries, but only 197 unique trajectories — the `build_dataset.py` was inadvertently run twice. The E1a/E1d SFT models were trained on 394 samples (197 unique, each with ×2 effective weight). Results are reported as-is; the duplication is unlikely to have changed conclusions given the small dataset regime.
 
 ---
 
